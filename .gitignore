@@ -1,0 +1,8 @@
+.env
+.env_template
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+venv/
+env/

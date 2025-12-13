@@ -205,3 +205,4 @@ Fichier résumé: market_summary.csv
 - ✅ Logique d'achat de deuxième jambe
 - ✅ Limitation DCA sur probabilités basses
 - ✅ Arrêt automatique sur profit cible
+# polymarket_bot

@@ -1,0 +1,35 @@
+# Configuration Polymarket - Copiez vers .env et remplissez vos vraies clés
+
+# ================================================
+# CLÉS POLYGON (EOA - Externally Owned Account)
+# ================================================
+# Votre clé privée Polygon pour signer les transactions
+# ⚠️  GARDER SECRÈT - Ne jamais committer !
+POLYGON_PRIVATE_KEY=0x...
+
+# ================================================
+# ADRESSE PROXY POLYMARKET (Funder)
+# ================================================
+# Adresse du wallet proxy Polymarket (Gnosis Safe)
+# Valeur par défaut recommandée par Polymarket:
+POLYMARKET_PROXY_ADDRESS=0x85Daaf9F20D31Dd9ffB838F0c7E1603F64A174Bc
+
+# ================================================
+# CLÉS API L2 (Authentification)
+# ================================================
+# Clés API Polymarket pour l'authentification L2
+# À obtenir depuis: https://polymarket.com/profile/api-keys
+CLOB_API_KEY=your_api_key_here
+CLOB_API_SECRET=your_api_secret_here
+CLOB_API_PASSPHRASE=your_passphrase_here
+
+# ================================================
+# INSTRUCTIONS DE CONFIGURATION
+# ================================================
+# 1. Copiez ce fichier vers .env: cp env_example.txt .env
+# 2. Remplissez POLYGON_PRIVATE_KEY avec votre clé privée Polygon
+# 3. Vérifiez POLYMARKET_PROXY_ADDRESS (devrait être la valeur par défaut)
+# 4. Obtenez vos clés API depuis Polymarket et remplissez les 3 champs
+# 5. Testez avec: python simple_clob_client.py
+
+

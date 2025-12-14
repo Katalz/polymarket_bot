@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 import time
 import math
+import json
+import os
 
 # -----------------------------
 # Config
@@ -28,31 +30,36 @@ class Config:
     # Acceptez d'avoir 2 ou 3 parts de différence, ce n'est pas grave.
     EPS_QTY: float = 3.0                 
 
-    # --- GARDE-FOUS (Loose) ---
-    # Autorisez le bot à "perdre" virtuellement 3$ au début pour construire la position
-    LOCK_KEEP_USD: float = -3.0          
+    # --- CAPITAL ($643) ---
+    BANKROLL: float = 643.0
+    BASE_ORDER_USD: float = 8.0          
+    MAX_EXPOSURE_USD: float = 24.0       
+    MAX_BULLETS: int = 3
+    MAX_CONCURRENT: int = 1  # Logic check needed if enforced here
+
+    # --- SAFETY ---
+    DAILY_LOSS_LIMIT_USD: float = 20.0
+    HARD_SAFETY_CAP: float = 30.0
     
-    # Votre capital réel (laissez une marge de sécurité)
-    MAX_EXPOSURE_USD: float = 16.50       
-
-    # --- SIZING (CRUCIAL POUR 140€) ---
-    # Il faut être au-dessus du minimum Polymarket (souvent 5$ notionnel ou 5 shares)
-    # 5.0$ est le minimum floor.
-    BASE_ORDER_USD: float = 5.0          
-    SCALE_ORDER_USD: float = 5.0        
-    MIN_SHARES: float = 5.0        # Minimum requis par Polymarket
-    HARD_SAFETY_CAP: float = 15.0  # Sécurité absolue : on ne paie jamais plus de 15$ pour un ticket
-    # --- VITESSE ---
-    # Tirez vite.
-    COOLDOWN_SEC: float = 0.2
-    # Simulation (mets une petite fee/slippage si tu veux un backtest réaliste)
-    FEE_RATE: float = 0.001              # 0.10%
-    SLIPPAGE: float = 0.001              # 0.10%
-
-    # --- EXIT STRATEGY (PR4) ---
+    # --- EXITS ---
+    TAKE_PROFIT_PCT: float = 0.12        # +12%
+    FORCE_EXIT_SECONDS: int = 30 
+    
+    # --- EDGE & GATING ---
+    EDGE_NET_ENTRY_MIN: float = -0.01   # +0.4%
+    EDGE_NET_ADDON_MIN: float = 0.008    # +0.8%
+    
+    # --- EXECUTION ---
+    SLIPPAGE: float = 0.01 
+    FEE_RATE: float = 0.00
+    MIN_SHARES: float = 10.0  # Approx $5-10
+    COOLDOWN_SEC: float = 0.5
     ENABLE_SELLING: bool = True
-    TAKE_PROFIT_PCT: float = 0.25        # +25% Unrelized PnL -> SELL ALL
-    FORCE_EXIT_SECONDS: int = 30         # Sell all at T-30s
+    
+    # Legacy
+    SCALE_ORDER_USD: float = 8.0
+    LOCK_KEEP_USD: float = -3.0 # Legacy allow
+
 
 # -----------------------------
 # Position + accounting
@@ -107,6 +114,11 @@ class Position:
             self.qty_no = max(0.0, self.qty_no - qty_sold)
             self.cost_usd -= revenue_usd
 
+    def worst_case_pnl(self) -> float:
+        # Returns the guaranteed minimum PnL (Locked Profit or Max Loss)
+        # Assuming payout is 1.0 per share.
+        return min(self.qty_yes, self.qty_no) - self.cost_usd
+
     def __repr__(self) -> str:
         return (f"Position(q_yes={self.qty_yes:.4f}, q_no={self.qty_no:.4f}, "
                 f"cost={self.cost_usd:.4f}, lock={self.locked_profit_usd():.4f}, "
@@ -119,6 +131,10 @@ class Position:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+def total_qty(pos: Position) -> float:
+    return pos.qty_yes + pos.qty_no
+
 
 def edge(price_yes: float, price_no: float) -> float:
     return 1.0 - (price_yes + price_no)
@@ -171,15 +187,21 @@ class Decision:
     action: str                         # "BUY_YES", "BUY_NO", "HOLD"
     usd: float = 0.0
     reason: str = ""
+    limit_px: float = 0.0               # Optional: Specific Limit Price for Execution
 
 class GabagoolLikeStrategy:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.stop_engaged = False 
+        self.bad_edge_ticks = 0 # PR Review: Smoothing counter for Quality Stop
 
     def can_trade(self, pos: Position) -> bool:
         return (time.time() - pos.last_trade_ts) >= self.cfg.COOLDOWN_SEC
-
+        
     def scale_allowed(self, pos: Position, p_yes: float, p_no: float) -> (bool, str):
+        if self.stop_engaged:
+            return False, "scale_blocked:hard_stop_active"
+            
         e = edge(p_yes, p_no)
         expo = pos.exposure_usd()
         
@@ -191,11 +213,6 @@ class GabagoolLikeStrategy:
         # Ratio d'utilisation du capital (ex: 0.10 pour 10%, 0.90 pour 90%)
         usage_ratio = expo / self.cfg.MAX_EXPOSURE_USD
         
-        # Seuil d'edge requis dynamique :
-        # - Au début (0% utilisé) : On accepte -1% d'edge (on paie le spread pour entrer)
-        # - Au milieu (50% utilisé) : On veut 0.5% d'edge positif
-        # - À la fin (90% utilisé) : On veut 3% d'edge (cherry picking)
-        
         if usage_ratio < 0.20:
             required_edge = -0.015 # Très agressif au début
         elif usage_ratio < 0.50:
@@ -206,10 +223,6 @@ class GabagoolLikeStrategy:
         if e < required_edge:
              return False, f"scale_blocked:edge_too_low({e:.3f}<{required_edge})"
 
-        # 3. Vérification de l'équilibre (SUPPRIMÉE pour Gabagool Directionnel)
-        # On n'exige plus d'avoir 2 jambes ni un Locked Profit positif.
-        # Seul le Risk Cap (Max Exposure) compte (déjà vérifié ci-dessus).
-        
         return True, "scale:allowed_exposure_ok"
 
     def check_exit_conditions(self, pos: Position, p_yes: float, p_no: float, time_rem: float) -> Optional[Decision]:
@@ -221,11 +234,31 @@ class GabagoolLikeStrategy:
             
         # 1. TIME EXIT (T-30s)
         # On ne veut pas subir la volatilité finale de la résolution.
+        # 1. TIME EXIT (T-30s)
         if time_rem <= self.cfg.FORCE_EXIT_SECONDS:
-            if pos.qty_yes > 1.0: # Petite tolérance pour dust
-                 return Decision("SELL_YES", pos.qty_yes, f"[EXIT] time_force_exit t={time_rem:.0f}s")
+            # Cascading Logic
+            # T-30s to T-5s: Aggressive Limit at Current Bid (Snap)
+            # T-5s: Panic Market Sell (handled by default 0.0 limit in live bot if we send 0.0 here?)
+            # Actually, we specify price.
+            
+            is_panic = (time_rem <= 5.0)
+            tag = "panic_t5" if is_panic else f"limit_t{int(time_rem)}"
+            
+            # Target Price
+            # If Panic: 0.0 (Live bot handles as 'Max Slippage')
+            # If Limit: Current Bid
+            px_yes = 0.0 if is_panic else p_yes # p_yes passed in check_exit is ASK? No deciding method passes ASK.
+            # check_exit_conditions calls with p_yes, p_no.
+            # In decide(): check_exit_conditions(pos, bid_yes, bid_no, ...)
+            # So p_yes IS BID YES.
+            
+            target_px_yes = 0.0 if is_panic else p_yes
+            target_px_no = 0.0 if is_panic else p_no
+            
+            if pos.qty_yes > 1.0:
+                 return Decision("SELL_YES", pos.qty_yes, f"[EXIT] time_{tag}", limit_px=target_px_yes)
             if pos.qty_no > 1.0:
-                 return Decision("SELL_NO", pos.qty_no, f"[EXIT] time_force_exit t={time_rem:.0f}s")
+                 return Decision("SELL_NO", pos.qty_no, f"[EXIT] time_{tag}", limit_px=target_px_no)
         
         # 2. TAKE PROFIT (Sniper)
         # On calcule le PnL latent. 
@@ -251,167 +284,89 @@ class GabagoolLikeStrategy:
         
         return None
 
-    def decide(self, pos: Position, p_yes: float, p_no: float, time_remaining: float = 900) -> Decision:
-        # Basic sanity & Edge calculation
-        p_yes = clamp(p_yes, 0.0001, 0.9999)
-        p_no = clamp(p_no, 0.0001, 0.9999)
-        e = edge(p_yes, p_no)
-
-        # 0) PR4: Check Exits FIRST
-        exit_dec = self.check_exit_conditions(pos, p_yes, p_no, time_remaining)
+    def decide(self, pos: Position, ask_yes: float, ask_no: float, bid_yes: float, bid_no: float, time_remaining: float = 900) -> Decision:
+        # --- 1) METRICS & SANITIZATION ---
+        ask_yes = clamp(ask_yes, 0.0001, 0.9999)
+        ask_no = clamp(ask_no, 0.0001, 0.9999)
+        bid_yes = clamp(bid_yes, 0.0001, 0.9999)
+        bid_no = clamp(bid_no, 0.0001, 0.9999)
+        
+        # Edge (Ask basis)
+        edge_raw = edge(ask_yes, ask_no)
+        spread_cost = max(0.00, (ask_yes + ask_no) - 1.0)
+        edge_net = edge_raw - spread_cost
+        
+        # Valuation (Bid basis) for Stop/Risk
+        unrealized_pnl = (pos.qty_yes * bid_yes + pos.qty_no * bid_no) - pos.cost_usd
+        total_q = pos.qty_yes + pos.qty_no
+        
+        # --- 2) EXITS (WATERFALL) ---
+        # Low-level check
+        exit_dec = self.check_exit_conditions(pos, bid_yes, bid_no, time_remaining)
         if exit_dec:
-            return exit_dec
+             exit_dec.reason = f"{exit_dec.reason} [STATS] raw={edge_raw:.3f} spr={spread_cost:.3f} net={edge_net:.3f} pnl={unrealized_pnl:.2f}"
+             return exit_dec
+             
+        # --- 3) STOP LOGIC (STATE MACHINE) ---
+        # A. Risk Stop: Circuit Breaker (-12$)
+        if total_q > 0 and unrealized_pnl <= -12.0:
+             if not self.stop_engaged:
+                  self.stop_engaged = True
+                  # Fallthrough
 
-        # --- FONCTION INTERNE : SIZING INTELLIGENT (Min Ticket Fix) ---
-        def _get_valid_usd(target_usd: float, price: float) -> tuple[float, str]:
-            """
-            Vérifie si le montant target_usd est suffisant pour acheter MIN_SHARES.
-            Si non, augmente le montant (Upgrade).
-            Si dépasse HARD_SAFETY_CAP, bloque (Safety).
-            """
-            # 1. Estimation du prix limite (pire cas avec slippage pour être sûr d'avoir les parts)
-            # On ajoute une petite marge de sécurité de 1% sur le prix pour le calcul du ticket
-            limit_price = min(price * (1.0 + self.cfg.SLIPPAGE + 0.01), 0.99)
-            
-            # 2. Coût minimum absolu pour respecter la règle des 5 shares (ou autre MIN_SHARES)
-            min_required_usd = self.cfg.MIN_SHARES * limit_price
-            
-            final_usd = target_usd
-            msg = ""
+        # B. Quality Stop: Net Edge < -0.01 for 8 ticks
+        if total_q > 0 and edge_net < -0.01:
+             self.bad_edge_ticks += 1
+             if self.bad_edge_ticks >= 8:
+                 self.stop_engaged = True
+        else:
+             self.bad_edge_ticks = 0
 
-            # 3. UPGRADE : Si on veut mettre moins que le minimum légal, on force le minimum
-            if final_usd < min_required_usd:
-                final_usd = min_required_usd
-                # msg = f"(forced min {final_usd:.2f}$)" 
-
-            # 4. SAFETY : Si le montant final dépasse la sécurité absolue (ex: 15$), on annule tout
-            if final_usd > self.cfg.HARD_SAFETY_CAP:
-                return 0.0, f"blocked:ticket_too_expensive_>{self.cfg.HARD_SAFETY_CAP}"
-            
-            return final_usd, msg
-        # --------------------------------------------------------------
-
-        # 1) Si pas de position: entrer opportuniste (cheap) OU edge évident
-        if pos.qty_yes == 0 and pos.qty_no == 0:
-            if p_yes <= self.cfg.CHEAP_YES_MAX:
-                usd, msg = _get_valid_usd(self.cfg.BASE_ORDER_USD, p_yes)
-                if usd > 0: return Decision("BUY_YES", usd, f"enter:cheap_yes e={e:.4f}{msg}")
-                else: return Decision("HOLD", 0.0, msg)
-
-            if p_no <= self.cfg.CHEAP_NO_MAX:
-                usd, msg = _get_valid_usd(self.cfg.BASE_ORDER_USD, p_no)
-                if usd > 0: return Decision("BUY_NO", usd, f"enter:cheap_no e={e:.4f}{msg}")
-                else: return Decision("HOLD", 0.0, msg)
-            
-            # Edge-first entry
-            if e >= self.cfg.SCALE_EDGE_MIN:
-                if p_yes < p_no:
-                    usd, msg = _get_valid_usd(self.cfg.BASE_ORDER_USD, p_yes)
-                    if usd > 0: return Decision("BUY_YES", usd, f"enter:edge_first_yes e={e:.4f}{msg}")
-                else:
-                    usd, msg = _get_valid_usd(self.cfg.BASE_ORDER_USD, p_no)
-                    if usd > 0: return Decision("BUY_NO", usd, f"enter:edge_first_no e={e:.4f}{msg}")
-            
-            return Decision("HOLD", 0.0, f"hold:no_signal e={e:.4f}")
-
-        # 2) DIRECTIONAL MOMENTUM (Gabagool Logic)
-        # Remplacement du "Hedge systematic" par "Conviction systematic"
-        imbalance = pos.qty_yes - pos.qty_no
-        total_qty = pos.qty_yes + pos.qty_no
+        # --- 4) IF STOP ENGAGED ---
+        if self.stop_engaged:
+             # COLLAPSE EXIT: Ultimate Bailout
+             if edge_net < -0.05 and unrealized_pnl < -8.0:
+                  if pos.qty_yes > 1: return Decision("SELL_YES", pos.qty_yes, f"[EXIT] collapse_bailout net={edge_net:.3f} pnl={unrealized_pnl:.2f}")
+                  if pos.qty_no > 1: return Decision("SELL_NO", pos.qty_no, f"[EXIT] collapse_bailout net={edge_net:.3f} pnl={unrealized_pnl:.2f}")
+             
+             return Decision("HOLD", 0.0, f"hold:stop_engaged [STATS] net={edge_net:.3f} pnl={unrealized_pnl:.2f}")
+             
+        # --- 5) ENTRY & ADD-ON GATES ---
+        is_entry = (total_q < 1.0)
         
-        # --- A. HARD STOP (Stop Opening on Adverse Move) ---
-        # Si on perd > 15% sur notre position moyenne, on arrête de renforcer (Stop Bleeding).
-        # Invariant PR3: Avg Price = Total Cost / Total Qty (Buy-only model)
-        if total_qty > 0:
-            avg_price = pos.cost_usd / total_qty
-            
-            # Check Stop YES
-            if imbalance > self.cfg.EPS_QTY: 
-                if p_yes < avg_price * 0.85:
-                    return Decision("HOLD", 0.0, f"[STOP] hard_stop_triggered adverse_move_yes (avg={avg_price:.2f} cur={p_yes:.2f})")
-            
-            # Check Stop NO
-            elif imbalance < -self.cfg.EPS_QTY:
-                if p_no < avg_price * 0.85:
-                     return Decision("HOLD", 0.0, f"[STOP] hard_stop_triggered adverse_move_no (avg={avg_price:.2f} cur={p_no:.2f})")
+        # A. Gating Check
+        required_edge = self.cfg.EDGE_NET_ENTRY_MIN if is_entry else self.cfg.EDGE_NET_ADDON_MIN
+        if edge_net <= required_edge:
+             return Decision("HOLD", 0.0, f"hold:no_value [STATS] net={edge_net:.3f} < req={required_edge:.3f}")
 
-        # --- B. MOMENTUM LOGIC ---
+        # B. Max Exposure Check
+        if (pos.cost_usd + self.cfg.BASE_ORDER_USD) > self.cfg.MAX_EXPOSURE_USD:
+             return Decision("HOLD", 0.0, f"hold:max_exposure [STATS] cost={pos.cost_usd:.2f} > max={self.cfg.MAX_EXPOSURE_USD}")
+             
+        # --- 6) EXECUTION (SNIPER) ---
+        msg = f"sniper:fire [STATS] net={edge_net:.3f} spr={spread_cost:.3f}"
         
-        # Cas 1: Long YES (Conviction YES)
-        if imbalance > self.cfg.EPS_QTY:
-             # INTERDICTION DE HEDGE (BUY NO)
-             # Sauf si on voulait coder un "Panic Exit" mais ici on fait simple : HOLD.
-             # On veut ADD-ON sur YES.
+        # Side Selection
+        target_side = "BUY_YES"
+        target_price = ask_yes
+        if pos.qty_no > pos.qty_yes:
+             target_side = "BUY_YES"
+             target_price = ask_yes
+        elif pos.qty_yes > pos.qty_no:
+             target_side = "BUY_NO"
+             target_price = ask_no
+        else:
+             target_side = "BUY_YES"
+             target_price = ask_yes
              
-             if p_yes <= self.cfg.CHEAP_YES_MAX or e >= self.cfg.SCALE_EDGE_MIN:
-                  # sizing standard (pas de martingale)
-                  usd, msg = _get_valid_usd(self.cfg.BASE_ORDER_USD, p_yes)
-                  if usd > 0:
-                       return Decision("BUY_YES", usd, f"[MOMO] conviction=YES action=BUY_YES reason=add_on e={e:.4f}{msg}")
-             
-             # Si l'edge favorise NO, on ne hedge pas, on HOLD (Blocked)
-             if p_no < p_yes:
-                  return Decision("HOLD", 0.0, f"[MOMO] hedge_blocked reason=conviction_mode_yes (edge favors NO)")
-             
-             return Decision("HOLD", 0.0, f"hold:momo_yes_waiting e={e:.4f}")
-
-        # Cas 2: Long NO (Conviction NO)
-        if imbalance < -self.cfg.EPS_QTY:
-             # INTERDICTION DE HEDGE (BUY YES)
-             
-             if p_no <= self.cfg.CHEAP_NO_MAX or e >= self.cfg.SCALE_EDGE_MIN:
-                  usd, msg = _get_valid_usd(self.cfg.BASE_ORDER_USD, p_no)
-                  if usd > 0:
-                       return Decision("BUY_NO", usd, f"[MOMO] conviction=NO action=BUY_NO reason=add_on e={e:.4f}{msg}")
-             
-             if p_yes < p_no:
-                  return Decision("HOLD", 0.0, f"[MOMO] hedge_blocked reason=conviction_mode_no (edge favors YES)")
-
-             return Decision("HOLD", 0.0, f"hold:momo_no_waiting e={e:.4f}")
+        # Min Shares Logic
+        req_usd = max(self.cfg.BASE_ORDER_USD, self.cfg.MIN_SHARES * target_price * 1.01)
         
-        # 3) Cas Neutre / Faible Imbalance -> Comportement Opportuniste (conservé ci-dessous si pas return avant)
-        # Si on retombe ici, c'est qu'on est équilibré. On laisse la logique de "Scale" normale prendre le relais.
-
-
-        # 4) Deux jambes et équilibré: SCALING (Accumulation)
-        allowed, reason = self.scale_allowed(pos, p_yes, p_no)
-        
-        if allowed:
-            mult = self.cfg.SCALE_MULT_STRONG if e >= self.cfg.SCALE_EDGE_STRONG else 1.0
-            raw_usd = self.cfg.SCALE_ORDER_USD * mult
-
-            # Simulation avec le montant corrigé (Min Ticket)
-            # Car si on force un montant plus gros, le worst case change !
-            
-            if p_yes <= p_no:
-                # Test BUY YES
-                usd, msg = _get_valid_usd(raw_usd, p_yes)
-                if usd <= 0: return Decision("HOLD", 0.0, msg)
-
-                px_eff = apply_fee_and_slippage(self.cfg, p_yes, "BUY")
-                qty = usd_to_qty(usd, px_eff)
-                worst_after = projected_worst_case(pos, add_yes=qty, add_cost=usd)
-
-                if worst_after >= self.cfg.LOCK_KEEP_USD:
-                    return Decision("BUY_YES", usd, f"{reason}:buy_yes e={e:.4f}{msg}")
-                else:
-                    return Decision("HOLD", 0.0, f"hold:scale_risk_too_high (worst:{worst_after:.2f})")
-
-            else:
-                # Test BUY NO
-                usd, msg = _get_valid_usd(raw_usd, p_no)
-                if usd <= 0: return Decision("HOLD", 0.0, msg)
-                
-                px_eff = apply_fee_and_slippage(self.cfg, p_no, "BUY")
-                qty = usd_to_qty(usd, px_eff)
-                worst_after = projected_worst_case(pos, add_no=qty, add_cost=usd)
-
-                if worst_after >= self.cfg.LOCK_KEEP_USD:
-                    return Decision("BUY_NO", usd, f"{reason}:buy_no e={e:.4f}{msg}")
-                else:
-                    return Decision("HOLD", 0.0, f"hold:scale_risk_too_high (worst:{worst_after:.2f})")
-
-        return Decision("HOLD", 0.0, f"hold:{reason} e={e:.4f}")
+        # Safety Cap
+        if req_usd > self.cfg.HARD_SAFETY_CAP:
+             return Decision("HOLD", 0.0, f"hold:safety_cap {req_usd:.2f} > {self.cfg.HARD_SAFETY_CAP}")
+             
+        return Decision(target_side, req_usd, msg)
 
 
 # -----------------------------
@@ -425,7 +380,7 @@ class PaperTrader:
         self.strategy = GabagoolLikeStrategy(cfg)
 
     def step(self, p_yes: float, p_no: float) -> Dict[str, Any]:
-        d = self.strategy.decide(self.pos, p_yes, p_no)
+        d = self.strategy.decide(self.pos, p_yes, p_no, 0.0, 0.0) # Dummy bids
 
         log: Dict[str, Any] = {
             "ts": time.time(),
@@ -507,12 +462,67 @@ if __name__ == "__main__":
 # live attend: decision.side, decision.size_yes, decision.size_no, decision.reason
 # -------------------------------------------------------------------
 
+def reset_live_strategy() -> None:
+    """Resets the global strategy instance for a new market."""
+    global _LIVE_STRAT
+    _LIVE_STRAT = GabagoolLikeStrategy(_LIVE_CFG)
+    
+STATE_FILE = "trader_state.json"
+
+def load_persistence(slug: str) -> bool:
+    """
+    Loads persisted state for a specific market slug.
+    Returns True if stop_engaged was restored.
+    """
+    if not os.path.exists(STATE_FILE):
+        return False
+        
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+            
+        market_state = data.get(slug, {})
+        if market_state.get("stop_engaged", False):
+            _LIVE_STRAT.stop_engaged = True
+            print(f"[PERSIST] Restored STOP state for {slug}")
+            return True
+            
+    except Exception as e:
+        print(f"[PERSIST] Load error: {e}")
+        
+    return False
+
+def save_persistence(slug: str) -> None:
+    """
+    Saves current strategy state (specifically stop_engaged) for the slug.
+    """
+    try:
+        data = {}
+        if os.path.exists(STATE_FILE):
+             try:
+                 with open(STATE_FILE, "r") as f:
+                     data = json.load(f)
+             except: pass # corrupted file?
+             
+        # Update slug
+        data[slug] = {
+            "stop_engaged": _LIVE_STRAT.stop_engaged,
+            "ts": time.time()
+        }
+        
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+            
+    except Exception as e:
+        print(f"[PERSIST] Save error: {e}")
+
 @dataclass(frozen=True)
 class LiveDecision:
-    side: str            # "BUY_YES", "BUY_NO", "HOLD"
-    size_yes: float      # USD à engager si BUY_YES
-    size_no: float       # USD à engager si BUY_NO
+    side: str
+    size_yes: float
+    size_no: float
     reason: str
+    limit_price: float = 0.0
 
 _LIVE_CFG = Config()
 _LIVE_STRAT = GabagoolLikeStrategy(_LIVE_CFG)
@@ -550,6 +560,8 @@ def decide_trade(
     *,
     price_yes: float,
     price_no: float,
+    bid_yes: float = 0.0,
+    bid_no: float = 0.0,
     qty_yes: float,
     qty_no: float,
     cost_yes: float,
@@ -577,7 +589,14 @@ def decide_trade(
         last_trade_ts=0.0,  # cooldown géré via _LIVE_LAST_TRADE_TS
     )
 
-    d = _LIVE_STRAT.decide(pos, float(price_yes), float(price_no))
+    d = _LIVE_STRAT.decide(
+        pos, 
+        float(price_yes), 
+        float(price_no), 
+        float(bid_yes), 
+        float(bid_no), 
+        float(time_to_expiry)
+    )
 
     # HOLD direct
     if d.action == "HOLD" or float(d.usd) <= 0.0:
@@ -588,6 +607,7 @@ def decide_trade(
         return LiveDecision("HOLD", 0.0, 0.0, "hold:cooldown_live")
 
     base_order_size = float(base_order_size)
+    limit_px = getattr(d, "limit_px", 0.0)
 
     # ---- BUY_YES ----
     if d.action == "BUY_YES":
@@ -599,7 +619,7 @@ def decide_trade(
         if usd <= 0.0:
             return LiveDecision("HOLD", 0.0, 0.0, "hold:usd_zero")
 
-        return LiveDecision("BUY_YES", usd, 0.0, d.reason)
+        return LiveDecision("BUY_YES", usd, 0.0, d.reason, limit_price=limit_px)
 
     # ---- BUY_NO ----
     if d.action == "BUY_NO":
@@ -611,19 +631,18 @@ def decide_trade(
         if usd <= 0.0:
             return LiveDecision("HOLD", 0.0, 0.0, "hold:usd_zero")
 
-        return LiveDecision("BUY_NO", 0.0, usd, d.reason)
+        return LiveDecision("BUY_NO", 0.0, usd, d.reason, limit_price=limit_px)
 
     # ---- SELL_YES (PR4) ----
     if d.action == "SELL_YES":
-        qty = float(d.usd) # d.usd holds QTY for SELL
+        qty = float(d.usd)
         if qty <= 0: return LiveDecision("HOLD", 0.0, 0.0, "hold:sell_qty_zero")
-        # size_yes carries the QTY
-        return LiveDecision("SELL_YES", qty, 0.0, d.reason)
+        return LiveDecision("SELL_YES", qty, 0.0, d.reason, limit_price=limit_px)
 
     # ---- SELL_NO (PR4) ----
     if d.action == "SELL_NO":
         qty = float(d.usd)
         if qty <= 0: return LiveDecision("HOLD", 0.0, 0.0, "hold:sell_qty_zero")
-        return LiveDecision("SELL_NO", 0.0, qty, d.reason)
+        return LiveDecision("SELL_NO", 0.0, qty, d.reason, limit_price=limit_px)
 
     return LiveDecision("HOLD", 0.0, 0.0, d.reason)

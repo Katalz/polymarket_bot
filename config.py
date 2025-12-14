@@ -31,32 +31,44 @@ PAPER_START_BALANCE = 1000.0
 # =========================
 # Risque / expo
 # =========================
-# Trop bas à 12 => tu bloques presque tout (et tu ne scales jamais comme lui)
-# Trop bas à 12 => tu bloques presque tout (et tu ne scales jamais comme lui)
-# MAX_EXPOSURE_PER_MARKET is deprecated. Use MAX_EXPOSURE_USD.
-# Sizing Pilot $140: 16.50$ allow 3 bullets of ~5.50$.
-MAX_EXPOSURE_USD = 16.50       
-BASE_ORDER_USD = 5.0          # Base Ticket
+# --- CAPITAL & RISK ($643 CONFIG) ---
+BANKROLL: float = 643.0
+daily_pnl: float = 0.0
+
+MAX_EXPOSURE_USD = 24.0      # Max 3 bullets (8 * 3)
+BASE_ORDER_USD = 8.0         # Base Ticket
 
 # =========================
 # EXIT STRATEGY (PR4: ACTIVE TRADING)
 # =========================
 ENABLE_SELLING: bool = True
-TAKE_PROFIT_PCT: float = 0.25        # +25% Gain -> SELL EVERYTHING
-FORCE_EXIT_SECONDS: int = 30         # Sell at T-30s to avoid final volatility
+TAKE_PROFIT_PCT: float = 0.12    # +12% Gain target
+FORCE_EXIT_SECONDS: int = 30     # Exit 30s before close
 
-# --- VITESSE ---
-# Tirez vite.cket
-
-# Gabagool tolère des worst-case plus profonds avant d'arrêter le scale
-# (appliqué seulement si 2 jambes existaient déjà avant le trade)
-MAX_LOSS_PER_MARKET = 18.0
+# --- SAFETY ---
+MAX_LOSS_PER_MARKET = 30.0
 
 # =========================
 # GLOBAL SAFETY (CIRCUIT BREAKERS)
 # =========================
-DAILY_LOSS_LIMIT_USD: float = 35.0   # Stop bot if cumulative loss > $35 (25% bankroll)
-MAX_CONSECUTIVE_LOSSES: int = 3      # Stop bot if 3 losing trades in a row
+DAILY_LOSS_LIMIT_USD: float = 20.0   # Approx 3% risk
+MAX_CONSECUTIVE_LOSSES: int = 3
+HARD_SAFETY_CAP: float = 30.0        # Absolute limit
+
+# =========================
+# MULTI-MARKET CONFIG
+# =========================
+MARKET_UNIVERSE = ["BTC", "ETH", "SOL", "XRP"]
+DRY_RUN_SCAN_ONLY = False # Set to False for LIVE TRADING
+SCAN_INTERVAL_SEC = 5.0    # Frequency of scanning when FLAT
+MAX_CONCURRENT_MARKETS = 1 # HARD CAP for $140 bankroll
+
+# NO FLY RULES & TIMEOUTS
+NO_FLY_MAX_SPREAD = 0.04
+NO_FLY_MIN_LIQUIDITY = 50.0 # $ depth verify
+NO_ENTRY_TIMEOUT = 45       # Unlock if no trade after X seconds locked
+
+
 
 # =========================
 # Live sizing

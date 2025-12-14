@@ -29,7 +29,7 @@ from py_clob_client.clob_types import ApiCreds
 from py_clob_client.clob_types import OrderArgs
 
 # ✅ needed for cooldown arming
-from paper_trader import decide_trade, arm_live_cooldown
+from paper_trader import decide_trade, arm_live_cooldown, reset_live_strategy, load_persistence, save_persistence
 
 from config import (
     CLOB_HOST,
@@ -43,6 +43,13 @@ from config import (
     FORCE_EXIT_SECONDS,  # PR4
     DAILY_LOSS_LIMIT_USD, # PR5
     MAX_CONSECUTIVE_LOSSES, # PR5
+    MARKET_UNIVERSE,      # PR-MULTI
+    DRY_RUN_SCAN_ONLY,    # PR-MULTI
+    SCAN_INTERVAL_SEC,    # PR-MULTI
+    MAX_CONCURRENT_MARKETS, # PR-MULTI
+    NO_FLY_MAX_SPREAD,
+    NO_FLY_MIN_LIQUIDITY,
+    NO_ENTRY_TIMEOUT
 )
 
 HOST = CLOB_HOST or "https://clob.polymarket.com"
@@ -55,7 +62,7 @@ TAKER_SLIPPAGE = 0.03
 PRICE_SAMPLE_USD = MAX_ORDER_AMOUNT_USDC
 
 LOG_FILE_PREFIX = "gabagool_log"
-TARGET_CRYPTOS = ["btc"]
+TARGET_CRYPTOS = [m.lower() for m in MARKET_UNIVERSE]
 MARKET_SUMMARY_FILE = "gabagool_markets_summary.csv"
 
 MIN_SHARES = 5.0
@@ -142,6 +149,18 @@ class PriceStreamer:
             filled += p * s
 
         return cost / qty if filled >= 0.9 * required_usd_size else 0.0
+
+    def get_best_bid(self, token_id):
+        with self.lock:
+            # Bids are 'buys' in the book. We (User) SELL into them.
+            # Usually bids are sorted Descending (Highest Price First).
+            bids = list(self.books.get(token_id, {}).get("bids", []))
+        if not bids:
+            return 0.0
+            
+        # Sort DESCENDING (Highest Bid is Best)
+        bids = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
+        return float(bids[0]["price"]) if bids else 0.0
 
 
 # ---------------- POSITION MANAGER ---------------- #
@@ -458,6 +477,213 @@ def discover_next_market(current_slug: str) -> dict | None:
     return candidates[0]
 
 
+# ==========================================
+# MULTI-MARKET SCANNER (PR-MULTI)
+# ==========================================
+
+def scan_active_markets(tickers=None):
+    if tickers is None:
+        tickers = MARKET_UNIVERSE
+        
+    """
+    PREDICTIVE SCAN:
+    Targets specific 15m markets by calculated slug.
+    Format: {ticker}-updown-15m-{expiry_ts}
+    """
+    import math 
+    
+    candidates = []
+    now_ts = time.time()
+    # Current 15m boundary (Start Time)
+    # Slug uses START time (ex: 14:00 for 14:00-14:15 range)
+    expiry_ts = math.floor(now_ts / 900) * 900
+    
+    # print(f"[SCAN] Target Start: {int(expiry_ts)}")
+
+    for ticker in tickers:
+        slug = f"{ticker.lower()}-updown-15m-{int(expiry_ts)}"
+        url = f"{GAMMA_API_BASE}/events"
+        params = {"slug": slug}
+        
+        try:
+            r = requests.get(url, params=params, timeout=3)
+            events = r.json()
+            
+            if not events:
+                # print(f"[DEBUG] Not found: {slug}")
+                continue
+                
+            e = events[0]
+            if e.get("closed"): continue
+            
+            # Active Window Check
+            try:
+                end = parser.isoparse(e["endDate"])
+                now_dt = datetime.now(timezone.utc)
+                remaining = (end - now_dt).total_seconds()
+                
+                # Sniper Window: [180, 850]
+                if not (180 <= remaining <= 850):
+                    print(f"[DEBUG] Skip time: {slug} rem={remaining:.1f}s not in [180, 850]")
+                    continue
+            except: continue
+            
+            # Parse Details
+            markets = e.get("markets") or []
+            if not markets: continue
+            m = markets[0]
+            
+            try:
+                clob_ids = json.loads(m.get("clobTokenIds", "[]"))
+                start = parser.isoparse(e["startDate"]) # Ensure start is parsed
+            except: continue
+            
+            if len(clob_ids) < 2: continue
+            
+            candidates.append({
+                "slug": e["slug"],
+                "question": m.get("question", slug),
+                "start_time": start.timestamp(), # Added
+                "end_time": end.timestamp(),
+                "token_id": clob_ids[0],
+                "no_token_id": clob_ids[1],
+                "remaining": remaining
+            })
+            
+        except Exception as err:
+            print(f"[SCAN] Error fetching {slug}: {err}")
+            continue
+            
+    return candidates
+
+
+class MarketScanner:
+    def __init__(self, client):
+        self.client = client
+        self.last_scan = 0
+        self.csv_file = "gabagool_scanner.csv"
+        
+        # Init CSV with extra columns if new
+        if not os.path.exists(self.csv_file):
+            with open(self.csv_file, "w", newline="") as f:
+                csv.writer(f).writerow(["timestamp", "candidates_count", "best_slug", "best_score", "action", "spread", "liquidity"])
+        
+    def scan(self):
+        now = time.time()
+        if now - self.last_scan < SCAN_INTERVAL_SEC:
+            return None
+        self.last_scan = now
+        
+        candidates = scan_active_markets()
+        
+        best_market = None
+        best_score = -1
+        best_slug = ""
+        
+        if candidates:
+            print(f"[SCAN] Found {len(candidates)} candidates. Scoring...")
+            for m in candidates:
+                score = self.get_score(m)
+                
+                # Retrieve stats stored by get_score
+                spr = m.get("spread", 0)
+                liq = m.get("liquidity", 0)
+                
+                print(f"   > {m['slug']}: score={score:.2f} (spr={spr:.3f}, liq=${liq:.0f})")
+                
+                if score > best_score:
+                    best_score = score
+                    best_market = m
+                    best_slug = m["slug"]
+        
+        # Log to CSV
+        try:
+            with open(self.csv_file, "a", newline="") as f:
+                action = "NONE"
+                if best_market and best_score > 0: action = "LOCK_CANDIDATE"
+                elif candidates: action = "LOW_SCORE"
+                else: action = "NO_CANDIDATES"
+                
+                spr_val = f"{best_market.get('spread',0):.3f}" if best_market else ""
+                liq_val = f"{best_market.get('liquidity',0):.0f}" if best_market else ""
+                
+                csv.writer(f).writerow([
+                    now, 
+                    len(candidates) if candidates else 0,
+                    best_slug,
+                    f"{best_score:.2f}",
+                    action,
+                    spr_val,
+                    liq_val
+                ])
+        except Exception as e:
+            print(f"[SCAN] CSV Log Error: {e}")
+                
+        # Threshold score >= 1.0
+        if best_market and best_score >= 1.0:
+            return best_market
+        return None
+        
+    def get_score(self, market):
+        try:
+            # Fetch L2 Snapshot
+            book = self.client.get_order_book(market["token_id"])
+            if not book: 
+                print(f"[DEBUG] No book for {market['slug']}")
+                return 0
+            
+            bids = book.bids
+            asks = book.asks
+            if not bids or not asks: 
+                print(f"[DEBUG] Empty book bids/asks for {market['slug']}")
+                return 0
+            
+            # CRITICAL FIX: Sort orders to find best prices
+            bids.sort(key=lambda x: float(x.price), reverse=True)
+            asks.sort(key=lambda x: float(x.price), reverse=False)
+            
+            best_bid = float(bids[0].price)
+            best_ask = float(asks[0].price)
+            
+            # NO_FLY: Extreme Prices (Market decided)
+            # Avoid buying if Prob > 80% or < 20%
+            if best_bid > 0.80 or best_ask < 0.20:
+                 print(f"[NO_FLY] {market['slug']} price extreme ({best_bid}/{best_ask})")
+                 return 0
+
+            spread = best_ask - best_bid
+            if spread <= 0: spread = 0.001
+            
+            # Store raw stats
+            market["spread"] = spread
+            
+            # NO_FLY: Spread check
+            if spread > NO_FLY_MAX_SPREAD: 
+                print(f"[NO_FLY] {market['slug']} spread={spread:.3f} > limit")
+                return 0
+            
+            # NO_FLY: Liquidity
+            # TODO: Implement 'Stability Check' (rolling avg over 3 scans) to avoid flash walls.
+            liq_bid = sum(float(x.size) for x in bids[:5])
+            liq_ask = sum(float(x.size) for x in asks[:5])
+            liquidity = min(liq_bid, liq_ask)
+            
+            # Store raw stats
+            market["liquidity"] = liquidity
+            
+            if liquidity < NO_FLY_MIN_LIQUIDITY: 
+                print(f"[NO_FLY] {market['slug']} liquidity=${liquidity:.0f} < limit")
+                return 0
+            
+            # Score
+            score = (0.01 / spread) * (liquidity / 1000)
+            return score
+            
+        except Exception as e:
+            print(f"[SCAN] Score error {market['slug']}: {e}")
+            return 0
+
+
 def execute_trade(session, decision, price):
     """
     Envoie un ordre BUY_YES / BUY_NO en live sur Polymarket.
@@ -512,8 +738,14 @@ def execute_trade(session, decision, price):
         # decision.size_x IS QTY
         target_qty = float(usd) # 'usd' var holds qty here
         if target_qty <= 0: return False
-        # Sell into Bid (Pire cas = Price - Slip)
-        limit_price = max(price - TAKER_SLIPPAGE, 0.01)
+        
+        # Check explicit Limit Price first (Cascading Exit)
+        explicit_limit = getattr(decision, "limit_price", 0.0)
+        if explicit_limit > 0.0:
+             limit_price = explicit_limit
+        else:
+             # Sell into Bid (Pire cas = Price - Slip)
+             limit_price = max(price - TAKER_SLIPPAGE, 0.01)
 
     projected_cost = target_qty * limit_price
     current_exposure = session.cost_yes + session.cost_no
@@ -634,7 +866,12 @@ def setup_new_market(client: ClobClient):
     """
     market = discover_market()
 
+    # Reset Strategy for new market & Load Persistence
+    reset_live_strategy()
+    load_persistence(market["slug"])
+
     streamer = PriceStreamer([market["token_id"], market["no_token_id"]])
+
     streamer.start()
 
     session = LiveTraderSession(market, client)
@@ -654,13 +891,15 @@ def setup_new_market(client: ClobClient):
 SESSION_REALIZED_PNL = 0.0
 SESSION_LOSS_COUNT = 0
 
-def run_bot():
+def run():
     global SESSION_REALIZED_PNL, SESSION_LOSS_COUNT
     
     print("---------------------------------------------------")
-    print("   GABAGOOL LITE - LIVE ARBITRAGE BOT (PR5: SAFE)")
-    print(f"   Bankroll: ~${MAX_EXPOSURE_USD} (Pilot)")
-    print(f"   Daily Loss Limit: -${DAILY_LOSS_LIMIT_USD}")
+    print("   GABAGOOL LITE - LIVE ARBITRAGE BOT (PR-MULTI)")
+    print(f"   Bankroll: ~${MAX_EXPOSURE_USD}")
+    print(f"   Daily Limit: -${DAILY_LOSS_LIMIT_USD}")
+    print(f"   Markets: {MARKET_UNIVERSE}")
+    print(f"   Mode: {'DRY RUN SCAN' if DRY_RUN_SCAN_ONLY else 'LIVE TRADING'}")
     print("---------------------------------------------------")
 
     load_dotenv()
@@ -669,34 +908,34 @@ def run_bot():
     funder = os.getenv("POLYMARKET_PROXY_ADDRESS")
 
     if not pk or not funder:
-        raise RuntimeError("Missing env vars (POLYGON_PRIVATE_KEY / POLYMARKET_PROXY_ADDRESS)")
+        raise RuntimeError("Missing env vars")
 
     pk = _norm_pk(pk)
 
-    # 1) tmp client L1 for creds (derive/create)
+    # 1) tmp client for creds
     tmp_client = ClobClient(host=HOST, key=pk, chain_id=CHAIN_ID)
     creds = get_or_create_clob_creds(tmp_client)
 
-    print("\n[CLOB] CREDENTIALS IN USE:")
-    print(f"API KEY        : {creds.api_key}")
-    print(f"API SECRET     : {creds.api_secret}")
-    print(f"API PASSPHRASE : {creds.api_passphrase}\n")
-
-    # 2) final client via proxy with creds
+    # 2) final client
     print("[>>] Connecting via Proxy...")
     client = ClobClient(
         host=HOST,
         key=pk,
         chain_id=CHAIN_ID,
-        signature_type=2,          # Gnosis Safe / proxy
-        funder=funder,             # proxy address
-        creds=creds                # API creds
+        signature_type=2,
+        funder=funder,
+        creds=creds
     )
 
-    # 3) init first market
-    market, streamer, session = setup_new_market(client)
-
-    log_file = f"{LOG_FILE_PREFIX}_{market['slug']}.csv"
+    # Init Scanner
+    scanner = MarketScanner(client)
+    
+    # State
+    active_market = None
+    streamer = None
+    session = None
+    log_file = None
+    
     fieldnames = [
         "timestamp","p_yes","p_no","edge","vol","mispricing",
         "q_yes","q_no","imbalance",
@@ -705,186 +944,182 @@ def run_bot():
         "decision_side","decision_usd",
         "act","reason","scale_cooldown","order_in_flight","time_remaining"
     ]
-
-    if not os.path.exists(log_file):
-        with open(log_file, "w", newline="") as f:
-            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
-
+    
     last_log_ts = 0.0
 
-    # Pre-loading state for instant market rotation
-    next_market = None
-    next_streamer = None
-    preload_triggered = False
-
-    print(f"[MARKET] Current: {market['slug']}")
-    print(f"[LIVE] TRADING STARTED on: {market['slug']}")
-    print(f"   YES token: {market['token_id']}")
-    print(f"   NO  token: {market['no_token_id']}")
-
     while True:
-        # --- PR5: SAFETY CHECK ---
+        # PR5 Safety
         if SESSION_REALIZED_PNL <= -DAILY_LOSS_LIMIT_USD:
             print(f"\n[CRITICAL] DAILY LOSS LIMIT BREACHED (-${abs(SESSION_REALIZED_PNL):.2f}). STOPPING.")
             break
             
         now = time.time()
-
-        time_remaining = float(market["end_time"]) - now
-        minutes_remaining = int(time_remaining / 60)
-
-        # ===================== DUTY CYCLE (2-on-1-off) =====================
-        # Pause aux minutes 13, 10, 7, 4, 1
-        # Formula: (min - 1) % 3 == 0. Excluding 0 (last minute active) and neg (expired).
-        if (minutes_remaining - 1) % 3 == 0 and minutes_remaining > 0:
-            print(f"[PAUSE] Gabagool Cycle (M{minutes_remaining}) time_remaining={time_remaining:.1f}s")
-            time.sleep(1)
-            continue
-        # ===================================================================
-
-        # ===================== PRELOAD NEXT MARKET (T-60s) =====================
-        if 0 < time_remaining <= 60 and next_market is None and not preload_triggered:
-            print(f"[MARKET] Preloading next market at t_remaining={time_remaining:.1f}s")
-            preload_triggered = True
-            try:
-                next_market = discover_next_market(market["slug"])
-                if next_market:
-                    next_streamer = PriceStreamer([next_market["token_id"], next_market["no_token_id"]])
-                    next_streamer.start()
-                    starts_in = next_market["start_time"] - now
-                    print(f"[MARKET] Preloading next: {next_market['slug']} (starts in {starts_in:.1f}s)")
-                else:
-                    print("[MARKET] No next market found for preload")
-            except Exception as e:
-                print(f"[!] Preload failed: {e}")
-        # ========================================================================
-
-        # ===================== MARKET ROTATION (T=0) =====================
-        if now >= float(market["end_time"]):
-            old_slug = market["slug"]
-            print(f"[MARKET] Switching {old_slug} -> ...")
-
-            # Stop current market resources
-            try:
-                streamer.stop()
-            except Exception:
-                pass
-            try:
-                session.pos_manager.stop()
-            except Exception:
-                pass
-
-            if next_market and next_streamer:
-                # Instant switch - streamer already warmed up
-                market = next_market
-                streamer = next_streamer
-                session = LiveTraderSession(market, client)
-                pm = PositionManager(client, market["token_id"], market["no_token_id"], session.order_in_flight)
+        
+        # ----------------------------------------
+        # STATE: SCANNING (FLAT)
+        # ----------------------------------------
+        if active_market is None:
+            best_market = scanner.scan()
+            
+            if DRY_RUN_SCAN_ONLY:
+                time.sleep(1)
+                continue
+                
+            if best_market:
+                active_market = best_market
+                lock_start_ts = now
+                
+                # Setup Session
+                streamer = PriceStreamer([active_market["token_id"], active_market["no_token_id"]])
+                streamer.start()
+                
+                session = LiveTraderSession(active_market, client)
+                pm = PositionManager(client, active_market["token_id"], active_market["no_token_id"], session.order_in_flight)
                 pm.start()
                 session.pos_manager = pm
-                print(f"[MARKET] INSTANT switch to {market['slug']}")
+                
+                print(f"[SELECT] Best market found: {active_market['slug']}")
+                print(f"[LOCK] TARGET LOCKED: {active_market['slug']}")
+                print(f"[LIVE] START TRADING on {active_market['slug']}")
+                
+                # Setup Log
+                log_file = f"{LOG_FILE_PREFIX}_{active_market['slug']}.csv"
+                if not os.path.exists(log_file):
+                    with open(log_file, "w", newline="") as f:
+                        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+                last_log_ts = 0.0
+                
             else:
-                # Fallback to discover (slower)
-                print("[MARKET] Fallback: discovering new market...")
-                market, streamer, session = setup_new_market(client)
+                time.sleep(1) # Wait for next scan interval
+                continue
+                
+        # ----------------------------------------
+        # STATE: LOCKED (TRADING)
+        # ----------------------------------------
+        
+        # UNLOCK: TIMEOUT (Flat & No Fill)
+        if (session.cost_yes + session.cost_no < 0.5) and (now - lock_start_ts > NO_ENTRY_TIMEOUT):
+             if not session.order_in_flight.is_set():
+                 print(f"[UNLOCK] Timeout ({NO_ENTRY_TIMEOUT}s) & Flat on {active_market['slug']}")
+                 if streamer: streamer.stop()
+                 if session.pos_manager: session.pos_manager.stop()
+                 active_market = None
+                 streamer = None
+                 session = None
+                 continue
 
-            # Reset preload state
-            next_market = None
-            next_streamer = None
-            preload_triggered = False
-
-            # New log file
-            log_file = f"{LOG_FILE_PREFIX}_{market['slug']}.csv"
-            if not os.path.exists(log_file):
-                with open(log_file, "w", newline="") as f:
-                    csv.DictWriter(f, fieldnames=fieldnames).writeheader()
-            last_log_ts = 0.0
-
-            print(f"[MARKET] Current: {market['slug']}")
-            print(f"[LIVE] TRADING STARTED on: {market['slug']}")
+        # Check Time Logic
+        time_remaining = float(active_market["end_time"]) - now
+        
+        # MARKET END EXIT
+        if time_remaining <= 0:
+            print(f"[UNLOCK] Market ended: {active_market['slug']}")
+            if streamer: streamer.stop()
+            if session.pos_manager: session.pos_manager.stop()
+            active_market = None
+            streamer = None
+            session = None
             continue
-        # ==================================================================
+            
+        # DUTY CYCLE (Pause logic)
+        minutes_remaining = int(time_remaining / 60)
+        if (minutes_remaining - 1) % 3 == 0 and minutes_remaining > 0:
+             # Just wait, don't execute trades
+             # But keep streamer running? Yes.
+             # print(f"[PAUSE] Cycle (M{minutes_remaining})")
+             time.sleep(1)
+             continue
 
         # --- prices ---
-        p_yes = streamer.get_best_price(session.token_id_yes, PRICE_SAMPLE_USD)
-        p_no  = streamer.get_best_price(session.token_id_no,  PRICE_SAMPLE_USD)
+        ask_yes = streamer.get_best_price(session.token_id_yes, PRICE_SAMPLE_USD)
+        ask_no  = streamer.get_best_price(session.token_id_no,  PRICE_SAMPLE_USD)
+        
+        # Actionable Bids (For Exits)
+        bid_yes = streamer.get_best_bid(session.token_id_yes)
+        bid_no  = streamer.get_best_bid(session.token_id_no)
+        
+        # Aliases for logging/checking if needed, but we pass clear names
+        p_yes, p_no = ask_yes, ask_no
+        
         if not p_yes or not p_no:
             time.sleep(SLEEP_BETWEEN_TICKS)
             continue
-
+            
         # --- state ---
         qy, qn = session.get_live_state()
         edge_val = 1 - (p_yes + p_no)
         exposure = session.cost_yes + session.cost_no
-        worst = worst_case_pnl_usd(qy, qn, session.cost_yes, session.cost_no)
+        
+        # Worst Case PnL using BIDS (Real Liquidation Value)
+        # Old worst_case_pnl_usd used manual calc?
+        # Let's pass raw values to decide_trade which reconstructs it.
+        # But we still calculate log stats here?
+        # worst = worst_case_pnl_usd(qy, qn, session.cost_yes, session.cost_no) <--- Uses COST basis.
+        # Actual "Liquidation Value" is (qy * bid_yes + qn * bid_no).
+        # We'll trust decide_trade to log the correct PnL.
+        
+        worst = worst_case_pnl_usd(qy, qn, session.cost_yes, session.cost_no) # Keep purely for visual continuity
         locked = (min(qy, qn) - exposure) if (qy and qn) else (-exposure)
+        
+        duration = float(active_market["end_time"]) - float(active_market["start_time"])
 
         # --- decision ---
         decision = decide_trade(
-            price_yes=p_yes,
-            price_no=p_no,
+            price_yes=ask_yes,
+            price_no=ask_no,
+            bid_yes=bid_yes,
+            bid_no=bid_no,
             qty_yes=qy,
             qty_no=qn,
             cost_yes=session.cost_yes,
             cost_no=session.cost_no,
             worst_case_pnl_current=worst,
-            time_to_expiry=time_remaining, # FIXED: was 60 hardcoded
-            total_market_duration=900,
-            btc_price=50000,
+            time_to_expiry=time_remaining,
+            total_market_duration=duration,
+            btc_price=50000, 
             btc_trend=0,
             base_order_size=BASE_ORDER_USD,
         )
-
-        # ✅ cooldown tickdown
+        
+        # Cooldown
         if session.scale_cooldown > 0:
             session.scale_cooldown -= 1
-
-        # ===================== LIVE EXECUTION =====================
+            
+        # PR-PERSIST: Save Stop State
+        if "stop_engaged" in decision.reason and not getattr(session, "stop_saved", False):
+             save_persistence(active_market["slug"])
+             session.stop_saved = True
+             print(f"[PERSIST] Saved STOP state for {active_market['slug']}")
+            
+        # --- Execution ---
         if decision.side in ("BUY_YES", "BUY_NO", "SELL_YES", "SELL_NO"):
-
-            # Compute trade_price and limit_price (worst case) upfront for filters
+            # Execute Trade Logic (same as before)
+            # trade_price calculation
             trade_price = p_yes if decision.side == "BUY_YES" else p_no
             limit_price = min(float(trade_price) + TAKER_SLIPPAGE, 0.99)
 
-            # 1) Hard block trades in last minute
+            # Blockers
             if time_remaining <= TRADE_LOCK_LAST_SECONDS:
-                print(f"[LOCK] Trade blocked (last {int(time_remaining)}s before expiry)")
-
-            # 2) Min price filter (on worst-case limit_price)
+                 if (int(time_remaining) % 10 == 0): print(f"[LOCK] Trade blocked (last {int(time_remaining)}s)")
             elif limit_price < MIN_TRADE_PRICE:
-                print(f"[LOCK] Trade blocked (limit_price={limit_price:.4f} < {MIN_TRADE_PRICE:.2f})")
-
+                 pass
             elif session.scale_cooldown > 0 and str(decision.reason).startswith("scale_"):
-                pass
-
+                 pass
             elif session.order_in_flight.is_set():
-                pass
-
+                 pass
             else:
-                usd_size = decision.size_yes if decision.side == "BUY_YES" else decision.size_no
+                 # Execute
+                 print(f"[>>] SIGNAL: {decision.side} | reason={decision.reason}")
+                 try:
+                     session.order_in_flight.set()
+                     ok = execute_trade(session=session, decision=decision, price=trade_price)
+                     if ok: arm_live_cooldown()
+                 except Exception as e:
+                     print(f"[X] ORDER FAIL: {e}")
+                 finally:
+                     session.order_in_flight.clear()
 
-                print(
-                    f"[>>] BUY SIGNAL: {decision.side} | usd={usd_size:.2f} | "
-                    f"px_yes={p_yes:.4f} px_no={p_no:.4f} | edge={edge_val:.4f} | reason={decision.reason}"
-                )
-
-                try:
-                    session.order_in_flight.set()
-
-                    ok = execute_trade(session=session, decision=decision, price=trade_price)
-
-                    if ok:
-                        arm_live_cooldown()  # cooldown arme uniquement si OK
-                        print("[OK] ORDER DONE (filled/accepted)")
-
-                except Exception as e:
-                    print(f"[X] ORDER FAILED: {e}")
-
-                finally:
-                    session.order_in_flight.clear()
-        # ==========================================================
-
-        # ===================== CSV LOGGING (throttled) =====================
+        # --- Logging ---
         if (now - last_log_ts) >= LOG_EVERY_SEC:
             with open(log_file, "a", newline="") as f:
                 csv.DictWriter(f, fieldnames=fieldnames).writerow({
@@ -913,10 +1148,8 @@ def run_bot():
                     "time_remaining": time_remaining
                 })
             last_log_ts = now
-        # ===================================================================
-
+            
         time.sleep(SLEEP_BETWEEN_TICKS)
-
 
 if __name__ == "__main__":
     run()

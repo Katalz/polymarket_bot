@@ -1,0 +1,1 @@
+timestamp,p_yes,p_no,edge,vol,mispricing,q_yes,q_no,imbalance,cost_yes,cost_no,exposure,locked_profit,profit_if_up,profit_if_down,worst_case_pnl,decision_side,decision_usd,act,reason,scale_cooldown,order_in_flight,time_remaining

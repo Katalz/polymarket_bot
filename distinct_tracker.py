@@ -14,7 +14,6 @@ import json
 import requests
 from datetime import datetime, timezone
 from dateutil import parser
-from market_discovery import scan_active_markets
 
 # =========================
 # CONFIGURATION
@@ -54,49 +53,86 @@ class GabagoolTracker:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         
     def discover_current_market(self):
-        """Trouve le marché crypto 15m actif via scan_active_markets (rapide)"""
-        print("[DISCOVER] Searching for active BTC 15m market (Fast Scan)...")
+        """Trouve le marché crypto 15m actif"""
+        print("[DISCOVER] Searching for active BTC 15m market...")
+        
+        url = f"{GAMMA_API}/events"
+        params = {
+            "closed": "false",
+            "limit": 200,
+            "order": "endDate",
+            "ascending": "true",
+        }
+        
         try:
-            candidates = scan_active_markets(["BTC"])
-            if not candidates:
-                print("[WARN] No active BTC 15m market found via scan")
-                return None
-                
-            # Prend le premier candidat actif
-            # scan_active_markets retourne déjà des marchés valides/ouverts
-            active = candidates[0]
-            
-            print(f"[OK] Found: {active['slug']}")
-            
-            # Mapping keys
-            # scan_active_markets: {slug, token_id (YES), no_token_id (NO), start_time, end_time}
-            # tracker needs: {slug, token_id_yes, token_id_no, start_time, end_time}
-            
-            return {
-                "slug": active["slug"],
-                "token_id_yes": active["token_id"],
-                "token_id_no": active["no_token_id"],
-                "start_time": active["start_time"],
-                "end_time": active["end_time"]
-            }
-
+            events = requests.get(url, params=params, timeout=10).json()
         except Exception as e:
-            print(f"[ERROR] Discovery error: {e}")
+            print(f"[ERROR] API error: {e}")
             return None
-
-    def scan_markets(self, include_next: bool = True) -> List[Dict]:
-        """Retourne la liste complète des marchés actifs (Current + Next)"""
-        candidates = scan_active_markets(["BTC"], include_next=include_next)
-        mapped = []
-        for c in candidates:
-            mapped.append({
-                "slug": c["slug"],
-                "token_id_yes": c["token_id"],
-                "token_id_no": c["no_token_id"],
-                "start_time": c["start_time"],
-                "end_time": c["end_time"]
-            })
-        return mapped
+        
+        now = datetime.now(timezone.utc)
+        
+        def slug_ok(slug):
+            s = (slug or "").lower()
+            if not any(c in s for c in TARGET_CRYPTOS):
+                return False
+            return ("15m" in s) or ("15min" in s)
+        
+        for e in events:
+            slug = e.get("slug", "")
+            if not slug_ok(slug):
+                continue
+            
+            try:
+                start = parser.isoparse(e["startDate"])
+                end = parser.isoparse(e["endDate"])
+            except:
+                continue
+            
+            # Le marché doit être actif (déjà commencé, pas encore fini)
+            if not (start <= now < end):
+                continue
+            
+            markets = e.get("markets") or []
+            if not markets:
+                continue
+            
+            m = markets[0]
+            
+            try:
+                token_ids = json.loads(m.get("clobTokenIds", "[]"))
+                outcomes = json.loads(m.get("outcomes", "[]"))
+            except:
+                continue
+            
+            if len(token_ids) < 2:
+                continue
+            
+            yes_id, no_id = None, None
+            for i, o in enumerate(outcomes):
+                o = str(o).lower()
+                if o in ("yes", "up"):
+                    yes_id = token_ids[i]
+                elif o in ("no", "down"):
+                    no_id = token_ids[i]
+            
+            yes_id = yes_id or token_ids[0]
+            no_id = no_id or token_ids[1]
+            
+            market = {
+                "slug": slug,
+                "token_id_yes": yes_id,
+                "token_id_no": no_id,
+                "start_time": start.timestamp(),
+                "end_time": end.timestamp(),
+            }
+            
+            print(f"[OK] Found: {slug}")
+            print(f"     Ends at: {end.isoformat()}")
+            return market
+        
+        print("[WARN] No active BTC 15m market found")
+        return None
     
     def setup_market(self, market):
         """Configure le tracking pour un nouveau marché"""
@@ -105,9 +141,10 @@ class GabagoolTracker:
         self.books_cache = {}
         self.trades_buffer = []  # Reset buffer for new market
         self.state = {"q_yes": 0, "q_no": 0, "expo": 0}  # Reset state
+
         
         # Créer le fichier CSV
-        csv_path = os.path.join(OUTPUT_DIR, f"distinct_{market['slug']}.csv")
+        csv_path = os.path.join(OUTPUT_DIR, f"gabagool_{market['slug']}.csv")
         self.current_csv = csv_path
         
         # Charger les trades existants si le fichier existe déjà

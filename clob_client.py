@@ -6,13 +6,16 @@ Client CLOB pour Polymarket - Prix temps réel read-only
 import logging
 from typing import Tuple, Dict, Any, Optional
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
+from eth_account import Account
 
 from config import (
     POLYGON_PRIVATE_KEY,
     CLOB_API_KEY,
     CLOB_API_SECRET,
     CLOB_API_PASSPHRASE,
-    CLOB_HOST
+    CLOB_HOST,
+    POLYMARKET_PROXY_ADDRESS
 )
 
 logger = logging.getLogger(__name__)
@@ -33,7 +36,8 @@ class PolymarketCLOBClientAuthenticated:
     """Client CLOB authentifié pour les opérations live trading"""
 
     def __init__(self, host: str = None, api_key: str = None, api_secret: str = None,
-                 api_passphrase: str = None, polygon_private_key: str = None):
+                 api_passphrase: str = None, polygon_private_key: str = None,
+                 proxy_address: str = None):
         """
         Initialise un client CLOB authentifié pour live trading.
 
@@ -43,6 +47,7 @@ class PolymarketCLOBClientAuthenticated:
             api_secret: Secret API CLOB
             api_passphrase: Passphrase API CLOB
             polygon_private_key: Clé privée Polygon pour signer les transactions
+            proxy_address: Adresse du proxy Gnosis Safe (Funder)
         """
         # Utiliser les valeurs de config si non fournies
         host = host or CLOB_HOST
@@ -55,16 +60,35 @@ class PolymarketCLOBClientAuthenticated:
         if not all([api_key, api_secret, api_passphrase, polygon_private_key]):
             raise ValueError("Toutes les clés d'authentification sont requises pour le live trading")
 
+        # Derive funder address logic REMOVED in favor of explicit Proxy Address
+        
+        # Use provided proxy address or fallback to config global
+        final_funder = proxy_address or POLYMARKET_PROXY_ADDRESS
+        
+        if not final_funder:
+             logger.warning("[Legacy] No Proxy Address provided. Using PK-derived address as funder (EOA Trading).")
+             try:
+                 final_funder = Account.from_key(polygon_private_key).address
+             except:
+                 pass
+
         # Créer le client authentifié
+        creds = ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase
+        )
+        
         self.client = ClobClient(
             host=host,
-            key=api_key,
-            secret=api_secret,
-            passphrase=api_passphrase,
-            signer=polygon_private_key
+            key=polygon_private_key, 
+            chain_id=137,
+            creds=creds,
+            signature_type=2, # EOA / Proxy (2 often implies Proxy/Safe on some libs, or EOA on others? Snippet says 2=Safe)
+            funder=final_funder # Pass PROXY ADDRESS here
         )
 
-        logger.info(f"🚨 CLOB client authentifié initialisé sur {host}")
+        logger.info(f"[ALERT] CLOB client authentifié initialisé sur {host}")
         logger.warning("MODE LIVE - ORDRES RÉELS POSSIBLES")
 
     def get_usdc_balance(self) -> float:

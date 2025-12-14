@@ -4,7 +4,13 @@ Fonctions pour la découverte automatique des marchés Bitcoin 15 minutes actifs
 
 import time
 import requests
+import json
+import math
+from datetime import datetime, timezone
+from dateutil import parser
 from typing import List, Dict, Optional
+
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
 
 def generate_btc_15min_slugs(hours_behind: int = 2, hours_ahead: int = 24) -> List[str]:
@@ -190,3 +196,102 @@ def wait_for_next_market(markets_list: List[Dict], current_market_slug: str) -> 
 
     print(f"Marche {next_market['slug']} devient actif !")
     return next_market
+
+
+def scan_active_markets(tickers: List[str], include_next: bool = False) -> List[Dict]:
+    """
+    Scans for active 15m markets for the given tickers.
+    Format: {ticker}-updown-15m-{expiry_ts}
+    If include_next=True, also scans for the NEXT 15m market (early detection).
+    """
+    candidates = []
+    now_ts = time.time()
+    # Current 15m boundary (Start Time)
+    current_expiry_ts = math.floor(now_ts / 900) * 900
+    
+    # Expiry candidates to check
+    expirations = [current_expiry_ts]
+    if include_next:
+         expirations.append(current_expiry_ts + 900) # Next 15m block
+    
+    for expiry_ts in expirations:
+        # Optimization: Early check against current time
+        # expiry_ts is the START of the 15m block.
+        # We want to skip if the market has already ENDED (Start + 900 < Now).
+        # We add a small buffer (e.g., skip if less than 30s remaining).
+        market_end_time = expiry_ts + 900
+        if market_end_time < (now_ts + 30): 
+            # Market ended or ending in <30s
+            # print(f"[SCAN] Skip {expiry_ts}: Ended or too close")
+            continue
+
+        for ticker in tickers:
+            slug = f"{ticker.lower()}-updown-15m-{int(expiry_ts)}"
+            url = f"{GAMMA_API_BASE}/events"
+            params = {"slug": slug}
+        
+        try:
+            r = requests.get(url, params=params, timeout=3)
+            events = r.json()
+            
+            if not events:
+                 continue
+                 
+            e = events[0]
+            if e.get("closed"): 
+                print(f"[SCAN] Rejected {slug}: CLOSED")
+                continue
+            
+            # Active Window Check
+            try:
+                start = parser.isoparse(e["startDate"])
+                end = parser.isoparse(e["endDate"])
+                now_dt = datetime.now(timezone.utc)
+                remaining = (end - now_dt).total_seconds()
+                
+                # Sniper Window: [60, 880] (Start + few mins -> End - few mins)
+                # If include_next is True, we allow early detection (up to 930s remaining = 30s before start)
+                upper_bound = 930 if include_next else 880
+                
+                # If too early (> upper_bound) or too late (< 60s remaining)
+                # Note: If looking for next market, remaining might be ~915s.
+                if not (60 <= remaining <= upper_bound):
+                    print(f"[SCAN] Rejected {slug}: Time window (rem={remaining:.0f}s not in [60, {upper_bound}])")
+                    continue
+            except Exception as e_parse: 
+                print(f"[SCAN] Rejected {slug}: Date parse error {e_parse}")
+                continue 
+                print(f"[SCAN] Rejected {slug}: Date parse error {e_parse}")
+                continue
+            
+            # Parse Details
+            markets = e.get("markets") or []
+            if not markets: 
+                print(f"[SCAN] Rejected {slug}: No markets data")
+                continue
+            m = markets[0]
+            
+            try:
+                clob_ids = json.loads(m.get("clobTokenIds", "[]"))
+            except: 
+                raw = m.get("clobTokenIds")
+                if isinstance(raw, list): clob_ids = raw
+                else: clob_ids = []
+                
+            if len(clob_ids) < 2: 
+                print(f"[SCAN] Rejected {slug}: Not enough tokens ({len(clob_ids)})")
+                continue
+            
+            candidates.append({
+                "slug": e["slug"],
+                "token_id": clob_ids[0],
+                "no_token_id": clob_ids[1],
+                "start_time": start.timestamp(),
+                "end_time": end.timestamp(),
+            })
+            
+        except Exception as err:
+            print(f"[SCAN] Error fetching {slug}: {err}")
+            continue
+            
+    return candidates

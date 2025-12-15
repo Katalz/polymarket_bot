@@ -1,2 +1,0 @@
-time_utc,timestamp,side,price,size,usd_volume,q_yes,q_no,exposure,locked_pnl,tx_hash,outcome
-2025-12-13T01:24:56,1765589096,NO,0.5,500.0,250.0,0,500.0,250.0,-250.0,0x05db6854eca01a773d77c01dd3d808b7e2d82b8149fd8b7d5b0d8e42e428edb8,down

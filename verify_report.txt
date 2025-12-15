@@ -1,0 +1,21 @@
+STRADDLE BOT VERIFICATION REPORT
+========================================
+
+MAKER INVARIANT: PASS
+TICK INVARIANT: PASS
+TIMEOUT INVARIANT: FAIL
+ONELEG INVARIANT: FAIL
+TIME INVARIANT: PASS
+UPDOWN MAPPING: PASS
+LOGGING COMPLETENESS: PASS
+PERSISTENCE: PASS
+
+DETAILED LOGS:
+- Maker invariant: Tests strict limit_price < best_ask enforcement
+- Tick invariant: Tests 0.01 tick rounding
+- Timeout invariant: Tests 20s order cancellation
+- One-leg invariant: Tests 6-8s unwind after partial fill
+- Time invariant: Tests slug-based time remaining calculation
+- UP/DOWN mapping: Tests correct outcome identification
+- Logging completeness: Tests all CSV fields are present
+- Persistence: Tests state save/load functionality

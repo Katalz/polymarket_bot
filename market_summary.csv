@@ -1,3 +1,0 @@
-market_id,start_timestamp,end_timestamp,final_qty_yes,final_avg_yes,final_qty_no,final_avg_no,pnl_if_yes,pnl_if_no,max_exposure,nb_trades,worst_case_pnl_during_window,max_theoretical_edge_seen,locked,closed_due_to_stop,final_guaranteed_profit
-btc-updown-15m-1765494000,1765408128.48369,1765494900.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0.0,0.0,0,0,-0.0
-btc-updown-15m-1765494900,1765408707.110753,1765495800.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0,0.0,0.0,0,0,-0.0

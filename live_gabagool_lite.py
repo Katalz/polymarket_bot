@@ -19,6 +19,7 @@ from py_clob_client.clob_types import ApiCreds
 
 from gabagool_lite.straddle_strategy import StraddleArbStrategy
 from gabagool_lite.polymarket_client import PolymarketClientWrapper
+from gabagool_lite.size_optimizer import SizeOptimizer, SizingConfig
 from gabagool_lite.utils_time import compute_time_remaining
 
 # CONSTANTS
@@ -28,6 +29,17 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 TARGET_CRYPTOS = ["btc"]
 LOG_FILE_PREFIX = "straddle_strategy_log"
 STATE_FILE = "gabagool_lite_state.json"
+
+# SIZING CONFIGURATION
+BANKROLL_USD = 10000.0  # Total bankroll for risk calculations
+SIZING_CONFIG = SizingConfig(
+    risk_frac=0.001,      # 0.1% of bankroll per trade
+    L_one=0.03,          # One-leg loss per share (2% slippage + 1% fees/spread)
+    k_up=200.0,          # Initial fill decay parameter for UP leg
+    k_down=200.0,        # Initial fill decay parameter for DOWN leg
+    max_size_cap=1000,   # Hard cap on size per straddle
+    test_size_shares=10  # Fixed size for test mode (zero real risk)
+)
 
 # ---------------- UTILS: PERSISTENCE ---------------- #
 
@@ -56,79 +68,182 @@ class OrderbookFetcher:
 
 # ---------------- UTILS: DISCOVERY ---------------- #
 
-def discover_market():
-    print("[DISCOVER] Searching for crypto 15m market (BTC)...")
-    url = f"{GAMMA_API_BASE}/events"
-    params = {
-        "closed": "false",
-        "limit": 200,
-        "order": "startDate",
-        "ascending": "false",  # Newest first
-    }
+def discover_market(is_test_mode=False):
+    """
+    Discover active BTC 15m markets.
+    Try direct API approach first, fallback to constructed slugs.
+    """
+    print("[DISCOVER] Searching for BTC 15m markets...")
+
+    # Method 1: Try markets API with BTC filter
     try:
-        events = requests.get(url, params=params, timeout=10).json()
-    except Exception as e:
-        print(f"[!] Discovery Error: {e}")
-        return None
-
-    now = datetime.now(timezone.utc)
-
-    for e in events:
-        slug = e.get("slug", "")
-        if "btc" not in slug.lower() or "15m" not in slug.lower():
-            continue
-
-        try:
-            start = parser.isoparse(e["startDate"])
-            end = parser.isoparse(e["endDate"])
-        except:
-            continue
-
-        # Only trade on markets that have started but haven't ended
-        if not (start.timestamp() <= now.timestamp() < end.timestamp()):
-            continue
-
-        markets = e.get("markets") or []
-        if not markets:
-            continue
-        m = markets[0]
-
-        try:
-            token_ids = json.loads(m.get("clobTokenIds", "[]"))
-            outcomes = json.loads(m.get("outcomes", "[]"))
-        except:
-            continue
-
-        if len(token_ids) < 2:
-            continue
-
-        # Find UP and DOWN tokens with verification
-        up_id, down_id = None, None
-        up_outcome, down_outcome = None, None
-
-        for i, o in enumerate(outcomes):
-            o_str = str(o).lower()
-            if o_str in ("yes", "up"):
-                up_id = token_ids[i]
-                up_outcome = o
-            elif o_str in ("no", "down"):
-                down_id = token_ids[i]
-                down_outcome = o
-
-        if not up_id or not down_id:
-            print(f"[DISCOVER] Missing UP/DOWN mapping for {slug}: outcomes={outcomes}")
-            continue
-
-        # UP/DOWN mapping verification
-        print(f"[MAPPING] {slug}: UP='{up_outcome}'({up_id}) DOWN='{down_outcome}'({down_id})")
-
-        return {
-            "slug": slug,
-            "up_token_id": up_id,
-            "down_token_id": down_id,
-            "start_ts": start.timestamp(),
-            "end_ts": end.timestamp()
+        url = f"{GAMMA_API_BASE}/markets"
+        params = {
+            "closed": "false",
+            "limit": 50,
+            "order": "endDate",
+            "ascending": "true",
         }
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        markets = data if isinstance(data, list) else data.get("markets", [])
+
+        now = datetime.now(timezone.utc)
+
+        for m in markets:
+            slug = m.get("slug", "")
+            if "btc" not in slug.lower() or "15m" not in slug.lower():
+                continue
+
+            print(f"[DISCOVER] Found BTC 15m market: {slug}")
+
+            # Parse timestamps
+            start_str = m.get("startDate") or m.get("start_date")
+            end_str = m.get("endDate") or m.get("end_date")
+
+            if not start_str or not end_str:
+                continue
+
+            try:
+                start = parser.isoparse(start_str)
+                end = parser.isoparse(end_str)
+            except:
+                continue
+
+            time_to_end = end.timestamp() - now.timestamp()
+            if time_to_end <= 0:
+                continue  # Already ended
+
+            # Parse tokens
+            try:
+                token_ids = json.loads(m.get("clobTokenIds", "[]"))
+                outcomes = json.loads(m.get("outcomes", "[]"))
+            except:
+                continue
+
+            if len(token_ids) < 2:
+                continue
+
+            # Find UP and DOWN tokens
+            up_id, down_id = None, None
+            for i, o in enumerate(outcomes):
+                o_str = str(o).lower()
+                if o_str in ("yes", "up"):
+                    up_id = token_ids[i]
+                elif o_str in ("no", "down"):
+                    down_id = token_ids[i]
+
+            if up_id and down_id:
+                print(f"[MAPPING] {slug}: UP({up_id}) DOWN({down_id})")
+                return {
+                    "slug": slug,
+                    "up_token_id": up_id,
+                    "down_token_id": down_id,
+                    "start_ts": start.timestamp(),
+                    "end_ts": end.timestamp()
+                }
+
+    except Exception as e:
+        print(f"[!] Markets API failed: {e}")
+
+    # Method 2: Fallback to constructed slugs if API fails
+    print("[DISCOVER] Trying constructed slugs...")
+    now_ts = int(time.time())
+
+    # Try the user's example and nearby timestamps
+    candidate_timestamps = [1765754100]  # User's example
+
+    # Add current and next boundaries
+    base = (now_ts // 900) * 900
+    for i in range(3):
+        candidate_timestamps.append(base + (i * 900))
+
+    # Sort candidates to check in order (past -> future)
+    # We prioritize the active market (start <= now < end)
+    for ts in sorted(list(set(candidate_timestamps))):
+        # Check if market has already ended (start + 15m <= now)
+        if ts + 900 <= now_ts:
+            continue
+
+        # Check if market is too far in the future
+        # This prevents picking a future market that triggers "Invalid time_remaining" (>1200s)
+        if ts > now_ts + 30: 
+            continue
+
+        slug = f"btc-updown-15m-{ts}"
+        try:
+            url = f"{GAMMA_API_BASE}/markets?slug={slug}"
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                # Handle list response if search endpoint used
+                if isinstance(data, list):
+                    if not data:
+                        continue
+                    market_data = data[0]
+                else:
+                    market_data = data
+                
+                if market_data.get("active", True):
+                    print(f"[DISCOVER] Found via slug: {slug}")
+                    # Parse and return as above
+                    start_str = market_data.get("startDate")
+                    end_str = market_data.get("endDate")
+                    if start_str and end_str:
+                        start = parser.isoparse(start_str)
+                        end = parser.isoparse(end_str)
+
+                        token_ids = json.loads(market_data.get("clobTokenIds", "[]"))
+                        outcomes = json.loads(market_data.get("outcomes", "[]"))
+
+                        up_id, down_id = None, None
+                        for i, o in enumerate(outcomes):
+                            if str(o).lower() in ("yes", "up"):
+                                up_id = token_ids[i]
+                            elif str(o).lower() in ("no", "down"):
+                                down_id = token_ids[i]
+
+                        if up_id and down_id:
+                            print(f"[MAPPING] {slug}: UP({up_id}) DOWN({down_id})")
+                            return {
+                                "slug": slug,
+                                "up_token_id": up_id,
+                                "down_token_id": down_id,
+                                "start_ts": start.timestamp(),
+                                "end_ts": end.timestamp()
+                            }
+        except:
+            continue
+
+    # If in test mode and no real markets found, construct slug from current time
+    if is_test_mode:
+        print("[DISCOVER] No real markets found - constructing test slug from current time")
+        now = int(time.time())
+
+        # Find the start of the current 15-minute interval
+        # This is what the real markets do - they align to 15-minute boundaries
+        current_interval_start = (now // 900) * 900  # Round down to nearest 15-minute boundary
+        current_interval_end = current_interval_start + 900
+
+        # Construct the expected slug format
+        test_slug = f"btc-updown-15m-{current_interval_start}"
+
+        print(f"[DEBUG] Current time: {now}")
+        print(f"[DEBUG] Current interval: {current_interval_start} to {current_interval_end}")
+        print(f"[DEBUG] Test slug: {test_slug}")
+
+        # For testing, we'll use fake tokens since the real market might not exist
+        return {
+            "slug": test_slug,
+            "up_token_id": "TEST_UP_TOKEN_123",
+            "down_token_id": "TEST_DOWN_TOKEN_456",
+            "start_ts": current_interval_start,
+            "end_ts": current_interval_end
+        }
+
+    print("[DISCOVER] No active BTC 15m markets found")
     return None
 
 # ---------------- MAIN ---------------- #
@@ -183,16 +298,26 @@ def run():
     # State Load
     persisted_state = load_state()
 
+    # Initialize Size Optimizer and calibrate from logs
+    size_optimizer = SizeOptimizer(SIZING_CONFIG)
+    size_optimizer.calibrate_from_logs()
+    print(f"[SIZING] Initialized with config: {size_optimizer.get_config_summary()}")
+
     # Loop Vars
     current_market = None
     strategy = None
     log_file = None
+    last_csv_log_time = 0
     
 
     while True:
+        # Define mode flags for this iteration
+        USE_TEST_SIZING = DRY_RUN and len(sys.argv) > 1 and sys.argv[1] == "test"
+
         # Discovery
         if not current_market:
-            m = discover_market()
+            is_test_mode = USE_TEST_SIZING
+            m = discover_market(is_test_mode=is_test_mode)
             if m:
                 current_market = m
                 slug = m["slug"]
@@ -203,8 +328,13 @@ def run():
                 if has_traded:
                     print(f"[STATE] Market {slug} already traded.")
 
-                # Initialize strategy
-                strategy = StraddleArbStrategy(slug, has_traded=has_traded)
+                # Initialize strategy with sizing optimizer
+                strategy = StraddleArbStrategy(
+                    slug=slug,
+                    has_traded=has_traded,
+                    size_optimizer=size_optimizer,
+                    bankroll_usd=BANKROLL_USD
+                )
 
                 # Setup log file with header if not exists
                 log_file = f"{LOG_FILE_PREFIX}_{slug}.csv"
@@ -217,23 +347,31 @@ def run():
                             "up_px", "down_px", "sum_px", "max_sum_price",
                             "decision", "blocked_maker", "order_age", "up_filled", "down_filled", "has_traded",
                             "intended_price_up", "rounded_price_up", "intended_price_down", "rounded_price_down",
-                            "cancel_reason", "unwind_method", "unwind_price", "unwind_result"
+                            "cancel_reason", "unwind_method", "unwind_price", "unwind_result",
+                            "optimal_size", "actual_size",
+                            "near_resolution_blocked", "force_flatten", "entry_cutoff_sec", "force_flatten_sec",
+                            "size_chosen", "size_max_usd", "size_max_final", "usd_per_market_cap",
+                            "straddle_notional_per_share", "size_block_reason", "test_mode", "used_test_preset", "test_preset_candidate",
+                            "min_leg_price", "max_leg_price", "min_profit_per_share", "profit_both", "price_bounds_ok", "profit_ok", "skip_reason", "blocked_price_bounds", "blocked_low_profit"
                         ])
                         writer.writeheader()
 
             else:
-                print("[DISCOVER] No market... sleep 10s")
-                time.sleep(10)
+                print("[DISCOVER] No market... sleep 2s")
+                time.sleep(2)
                 continue
 
         # Check expiry using slug-parsed time remaining
         now = time.time()
         time_remaining = compute_time_remaining(current_market["slug"], now)
         if time_remaining <= 0:
-            print("[MARKET] Expired. Resetting.")
+            print("[MARKET] Expired. Switching to next market immediately.")
             current_market = None
             strategy = None
+            # Continue without sleep to find next market immediately
             continue
+        elif time_remaining <= 60:  # Less than 1 minute remaining
+            print(f"[MARKET] Market ending soon: {time_remaining:.0f}s remaining")
 
         # Get fresh orderbooks
         try:
@@ -247,38 +385,63 @@ def run():
         # Strategy tick
         enter_result = None
         if strategy.state.value == "IDLE":
-            # Try to enter straddle
-            enter_result = strategy.maybe_enter(up_bid, up_ask, down_bid, down_ask, time_remaining)
+            # Try to enter straddle with sizing optimization
+            # Note: For available_balance, we'd need to query actual balance from Polymarket
+            # For now, using a conservative estimate
+            available_balance = BANKROLL_USD * 0.5  # Conservative estimate
+            liquidity_depth = 500  # Conservative liquidity estimate
+
+            # Detect test mode from argv
+            is_test_mode = DRY_RUN and len(sys.argv) > 1 and sys.argv[1] == "test"
+
+            enter_result = strategy.maybe_enter(
+                up_bid, up_ask, down_bid, down_ask, time_remaining,
+                available_balance=available_balance,
+                liquidity_depth=liquidity_depth,
+                test_mode=USE_TEST_SIZING
+            )
+
             if enter_result["action"] == "ENTER":
+                optimal_size = enter_result.get("size", 1)
+                sizing_debug = enter_result.get("sizing_debug", {})
+
                 if not DRY_RUN:
-                    print(f"[EXEC] Placing straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f}")
+                    print(f"[EXEC] Placing straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f} Size={optimal_size}")
 
                     up_order_id = pm_wrapper.place_limit_maker(current_market["up_token_id"],
-                                                             enter_result["up_price"], 5.0)
+                                                             enter_result["up_price"], optimal_size)
                     down_order_id = pm_wrapper.place_limit_maker(current_market["down_token_id"],
-                                                                enter_result["down_price"], 5.0)
+                                                                enter_result["down_price"], optimal_size)
 
                     if up_order_id and down_order_id:
-                        strategy.on_orders_placed(up_order_id, down_order_id)
-                        print(f"[OK] Orders placed: UP={up_order_id}, DOWN={down_order_id}")
+                        strategy.on_orders_placed(up_order_id, down_order_id, optimal_size)
+                        print(f"[OK] Orders placed: UP={up_order_id}, DOWN={down_order_id}, Size={optimal_size}")
+                        if 'best_ev' in sizing_debug:
+                            print(".2f")
                     else:
                         print("[X] Order placement failed")
                 else:
-                    print(f"[EXEC] (DRY) Would place straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f}")
+                    print(f"[EXEC] (DRY) Would place straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f} Size={optimal_size}")
                     # Simulate order placement for dry run
-                    strategy.on_orders_placed("DRY_UP", "DRY_DOWN")
+                    strategy.on_orders_placed("DRY_UP", "DRY_DOWN", optimal_size)
+
+            # Determine if we should use test sizing
+        # USE_TEST_SIZING defined at top of loop
+
 
         # Check for timeouts
-        should_cancel, order_id, reason = strategy.should_cancel_timeout()
+        should_cancel, order_id, reason = strategy.should_cancel_timeout(time_remaining)
         if should_cancel:
             if not DRY_RUN:
                 print(f"[TIMEOUT] Cancelling {order_id}: {reason}")
                 pm_wrapper.cancel_order(order_id)
+                strategy.on_order_canceled(order_id)
             else:
                 print(f"[TIMEOUT] (DRY) Would cancel {order_id}: {reason}")
+                strategy.on_order_canceled(order_id)
 
         # Check for one-leg unwind
-        should_unwind, leg, reason = strategy.should_unwind_one_leg()
+        should_unwind, leg, reason = strategy.should_unwind_one_leg(time_remaining)
         if should_unwind:
             token_id = current_market["up_token_id"] if leg == "UP" else current_market["down_token_id"]
             unwind_price = pm_wrapper.get_orderbook(token_id)[1] * (1.0 - 0.02)  # 2% slippage
@@ -296,7 +459,6 @@ def run():
 
                 # Mark as done after unwind attempt
                 strategy.state = strategy.state.DONE
-                strategy.has_traded = True
                 persisted_state[current_market["slug"]] = True
                 save_state(persisted_state)
             else:
@@ -329,39 +491,60 @@ def run():
                 print(f"[FILL] (DRY) DOWN order filled")
 
         # Log data
-        log_data = strategy.get_log_data(up_bid, up_ask, down_bid, down_ask, now, enter_result)
+        # Append to CSV log (Decimated: Only if !IDLE or >2s elapsed)
+        status = strategy.state.value
+        now_ts = now # Use the 'now' from earlier
+        log_filename = log_file # Use the log_file determined earlier
 
-        # Use slug-parsed timestamps for logging (not API timestamps)
-        from gabagool_lite.utils_time import parse_market_start_ts
-        market_start_ts = parse_market_start_ts(current_market["slug"])
-        if market_start_ts:
-            log_data["market_start_ts"] = market_start_ts
-            log_data["market_end_ts"] = market_start_ts + 900.0  # 15 minutes
-        else:
-            log_data["market_start_ts"] = 0.0
-            log_data["market_end_ts"] = 0.0
+        should_log_csv = (status != "IDLE") or (now_ts - last_csv_log_time > 2.0)
+        
+        if should_log_csv:
+            log_data = strategy.get_log_data(
+                up_bid, up_ask, down_bid, down_ask, now_ts,
+                enter_result=enter_result,
+                sizing_debug=enter_result.get('sizing_debug') if enter_result else None
+            )
+            
+            # Enrich log data
+            from gabagool_lite.utils_time import parse_market_start_ts
+            market_start_ts = parse_market_start_ts(current_market["slug"])
+            market_end_ts = market_start_ts + 900.0 if market_start_ts else 0.0 # 15 minutes
 
-        log_data["now_ts"] = now
-        log_data["time_remaining"] = time_remaining
-
-        # Calculate order age for logging
-        if strategy.state.value == "ORDERS_OPEN":
-            log_data["order_age"] = now - min(strategy.up_order_time, strategy.down_order_time)
-        else:
-            log_data["order_age"] = 0.0
-
-        # Write log
-        with open(log_file, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "timestamp", "slug", "market_start_ts", "market_end_ts", "now_ts", "time_remaining",
-                "up_bid", "up_ask", "down_bid", "down_ask",
-                "up_px", "down_px", "sum_px", "max_sum_price",
-                "decision", "blocked_maker", "order_age", "up_filled", "down_filled", "has_traded",
-                "intended_price_up", "rounded_price_up", "intended_price_down", "rounded_price_down",
-                "cancel_reason", "unwind_method", "unwind_price", "unwind_result"
-            ])
-            writer.writerow(log_data)
-            f.flush()
+            log_data.update({
+                'timestamp': now_ts,
+                'slug': current_market['slug'],
+                'market_start_ts': market_start_ts,
+                'market_end_ts': market_end_ts,
+                'time_remaining': time_remaining
+            })
+            
+            file_exists = os.path.exists(log_filename) and os.path.getsize(log_filename) > 0
+            with open(log_filename, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "timestamp", "slug", "market_start_ts", "market_end_ts", "now_ts", "time_remaining",
+                    "up_bid", "up_ask", "down_bid", "down_ask",
+                    "up_px", "down_px", "sum_px", "max_sum_price",
+                    "decision", "blocked_maker", "order_age",
+                    "up_filled", "down_filled", "has_traded",
+                    "intended_price_up", "rounded_price_up", 
+                    "intended_price_down", "rounded_price_down",
+                    "cancel_reason", "unwind_method", "unwind_price", "unwind_result",
+                    "optimal_size", "actual_size",
+                    "near_resolution_blocked", "force_flatten",
+                    "entry_cutoff_sec", "force_flatten_sec",
+                    "size_chosen", "size_max_usd", "size_max_final", 
+                    "usd_per_market_cap", "straddle_notional_per_share",
+                    "size_block_reason", "test_mode",
+                    "used_test_preset", "test_preset_candidate",
+                    "min_leg_price", "max_leg_price", "min_profit_per_share",
+                    "profit_both", "price_bounds_ok", "profit_ok",
+                    "skip_reason", "blocked_price_bounds", "blocked_low_profit"
+                ])
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(log_data)
+                
+            last_csv_log_time = now_ts
 
         time.sleep(0.5)
 
@@ -395,7 +578,7 @@ def run_verify_mode():
         # Test case 1: Normal case (should pass)
         up_bid, up_ask = 0.45, 0.55
         down_bid, down_ask = 0.45, 0.55
-        time_remaining = 100.0
+        time_remaining = 300.0  # Above ENTRY_CUTOFF_SEC (180)
 
         result = strategy.maybe_enter(up_bid, up_ask, down_bid, down_ask, time_remaining)
         if result['action'] == 'ENTER' and not result.get('blocked_maker', False):
@@ -469,6 +652,52 @@ def run_verify_mode():
     except Exception as e:
         print(f"  ✗ Time invariant test failed: {e}")
 
+    # Test 3.5: Timeout invariant
+    print("[VERIFY] Testing timeout invariant...")
+    try:
+        strategy = StraddleArbStrategy("test-market", has_traded=False)
+
+        # Place orders
+        strategy.on_orders_placed("order1", "order2")
+
+        # Simulate time passing (more than 20s)
+        strategy.up_order_time = time.time() - 25
+        strategy.down_order_time = time.time() - 25
+
+        should_cancel, order_id, reason = strategy.should_cancel_timeout(time_remaining=1000)
+
+        if should_cancel and "timeout" in reason:
+            print("  ✓ Timeout invariant: Order timeout works correctly")
+            results['timeout_invariant'] = True
+        else:
+            print("  ✗ Timeout invariant: Timeout logic failed")
+
+    except Exception as e:
+        print(f"  ✗ Timeout invariant test failed: {e}")
+
+    # Test 3.6: One-leg invariant
+    print("[VERIFY] Testing one-leg invariant...")
+    try:
+        strategy = StraddleArbStrategy("test-market", has_traded=False)
+
+        # Simulate one leg filled
+        strategy.on_orders_placed("order1", "order2")
+        strategy.on_order_update("order1", True)  # UP filled
+
+        # Manually set the fill time to be old enough to trigger unwind
+        strategy.one_leg_fill_time = time.time() - 10  # 10 seconds ago
+
+        should_unwind, leg, reason = strategy.should_unwind_one_leg(time_remaining=1000)
+
+        if should_unwind and leg == "UP" and "One-leg timeout" in reason:
+            print("  ✓ One-leg invariant: Unwind logic works correctly")
+            results['oneleg_invariant'] = True
+        else:
+            print("  ✗ One-leg invariant: Unwind logic failed")
+
+    except Exception as e:
+        print(f"  ✗ One-leg invariant test failed: {e}")
+
     # Test 4: UP/DOWN mapping (already tested in discovery, but we can verify the logic)
     print("[VERIFY] Testing UP/DOWN mapping logic...")
     try:
@@ -504,7 +733,8 @@ def run_verify_mode():
             'up_bid', 'up_ask', 'down_bid', 'down_ask', 'up_px', 'down_px', 'sum_px', 'max_sum_price',
             'decision', 'blocked_maker', 'order_age', 'up_filled', 'down_filled', 'has_traded',
             'intended_price_up', 'rounded_price_up', 'intended_price_down', 'rounded_price_down',
-            'cancel_reason', 'unwind_method', 'unwind_price', 'unwind_result'
+            'cancel_reason', 'unwind_method', 'unwind_price', 'unwind_result',
+            'optimal_size', 'actual_size'
         ]
 
         missing_fields = [f for f in required_fields if f not in log_data]

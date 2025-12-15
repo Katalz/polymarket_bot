@@ -34,28 +34,28 @@ class PolymarketClientWrapper:
 
             # Extract bids and asks
             if hasattr(orderbook, 'bids') and hasattr(orderbook, 'asks'):
-                bids = orderbook.bids
-                asks = orderbook.asks
+                bids = list(orderbook.bids)
+                asks = list(orderbook.asks)
             elif isinstance(orderbook, dict):
-                bids = orderbook.get('bids', [])
-                asks = orderbook.get('asks', [])
+                bids = list(orderbook.get('bids', []))
+                asks = list(orderbook.get('asks', []))
             else:
                 raise ValueError(f"Unknown orderbook format: {type(orderbook)}")
 
-            # Get best prices
-            best_bid = 0.0
-            if bids:
-                if hasattr(bids[0], 'price'):
-                    best_bid = float(bids[0].price)
-                elif isinstance(bids[0], dict):
-                    best_bid = float(bids[0].get('price', 0))
+            def _get_price(item):
+                if hasattr(item, 'price'):
+                    return float(item.price)
+                return float(item.get('price', 0))
 
-            best_ask = 1.0
-            if asks:
-                if hasattr(asks[0], 'price'):
-                    best_ask = float(asks[0].price)
-                elif isinstance(asks[0], dict):
-                    best_ask = float(asks[0].get('price', 0))
+            # Sort bids (highest first) and asks (lowest first)
+            # The API *should* return them sorted, but user reports otherwise.
+            # Explicit sorting guarantees we see the true top of book.
+            bids.sort(key=_get_price, reverse=True)
+            asks.sort(key=_get_price, reverse=False)
+
+            # Get best prices
+            best_bid = _get_price(bids[0]) if bids else 0.0
+            best_ask = _get_price(asks[0]) if asks else 1.0
 
             return best_bid, best_ask
 
@@ -141,6 +141,14 @@ class PolymarketClientWrapper:
             order = self.client.get_order(order_id)
             if isinstance(order, list) and order:
                 order = order[0]
+
+            if not order:
+                # Order not found or not returned
+                return False # Assume active/not filled if we can't find it?? Or None?
+                # If we return None, the loop continues.
+                # If we return False, it assumes not filled.
+                return False
+
 
             filled_size = float(order.get("size_matched", 0) or 0)
             total_size = float(order.get("size", 1) or 1)

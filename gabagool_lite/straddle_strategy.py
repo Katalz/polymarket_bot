@@ -52,9 +52,34 @@ class StraddleArbStrategy:
         self.TICK_SIZE = 0.01
         self.ORDER_TIMEOUT_SEC = 20.0
         self.ONE_LEG_UNWIND_TIMEOUT_SEC = 7.0  # Between 6-8s
+        
+        # Price and Profit Bounds (New Configs)
+        self.MIN_LEG_PRICE = 0.10
+        self.MAX_LEG_PRICE = 0.90
+        self.MIN_PROFIT_PER_SHARE = 0.02
+        
+        # Near resolution safety guards
+        self.ENTRY_CUTOFF_SEC = 180  # No new straddles if less than 3 minutes remaining
+        self.FORCE_FLATTEN_SEC = 60  # Force flatten one-leg risk within last 60s
+
+        # USD exposure caps and test sizing
+        self.MAX_USD_PER_MARKET = 30.0  # Max USD exposure per market
+        self.TEST_MODE_SIZES = [1, 5, 10]  # Test size presets
+        self.MIN_TEST_SIZE_SHARES = 1  # Minimum test size
 
         # Unwind tracking
         self.one_leg_fill_time: float = 0.0
+        self._last_unwind_method: str = ""
+        self._last_unwind_price: float = 0.0
+        self._last_unwind_result: str = ""
+        self._taker_path_attempted: bool = False
+
+        # Persistent entry snapshot (for logging consistency)
+        self.entry_up_px: float = 0.0
+        self.entry_down_px: float = 0.0
+        self.entry_sum_px: float = 0.0
+        self.entry_profit: float = 0.0
+        self.entry_max_leg_price: float = 0.0
 
     def round_to_tick(self, price: float) -> float:
         """Round price to tick size (0.01)."""
@@ -62,7 +87,7 @@ class StraddleArbStrategy:
 
     def maybe_enter(self, up_bid: float, up_ask: float, down_bid: float, down_ask: float,
                    time_remaining: float, available_balance: Optional[float] = None,
-                   liquidity_depth: Optional[float] = None) -> Dict[str, Any]:
+                   liquidity_depth: Optional[float] = None, test_mode: bool = False) -> Dict[str, Any]:
         """
         Check if we should enter straddle position with EV-optimized sizing.
 
@@ -80,13 +105,27 @@ class StraddleArbStrategy:
         - 'sizing_debug': dict (sizing optimization details)
         """
         if self.has_traded:
-            return {'action': 'IDLE', 'reason': 'Already traded this market', 'blocked_maker': False}
+            return {'action': 'IDLE', 'reason': 'Already traded this market', 'blocked_maker': False,
+                   'near_resolution_blocked': False, 'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC}
 
         if self.state != StraddleState.IDLE:
-            return {'action': 'IDLE', 'reason': f'Already in state {self.state.value}', 'blocked_maker': False}
+            return {'action': 'IDLE', 'reason': f'Already in state {self.state.value}', 'blocked_maker': False,
+                   'near_resolution_blocked': False, 'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC}
 
         if time_remaining <= 0:
-            return {'action': 'IDLE', 'reason': 'Market expired', 'blocked_maker': False}
+            return {'action': 'IDLE', 'reason': 'Market expired', 'blocked_maker': False,
+                   'near_resolution_blocked': False, 'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC}
+
+        # NEAR RESOLUTION SAFETY: Block new entries too close to resolution
+        near_resolution_blocked = False
+        if time_remaining < self.ENTRY_CUTOFF_SEC:
+            return {
+                'action': 'IDLE',
+                'reason': f'SKIP_NEAR_RESOLUTION: {time_remaining:.0f}s < {self.ENTRY_CUTOFF_SEC}s cutoff',
+                'blocked_maker': False,
+                'near_resolution_blocked': True,
+                'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC
+            }
 
         # Find optimal maker prices (intended prices before rounding)
         intended_up_price = min(up_bid + self.TICK_SIZE, up_ask - self.TICK_SIZE)
@@ -96,12 +135,57 @@ class StraddleArbStrategy:
         up_price = round_to_tick(intended_up_price, self.TICK_SIZE)
         down_price = round_to_tick(intended_down_price, self.TICK_SIZE)
 
+        # -------------------------------------------------------------------------
+        # 1) HARD PRICE BOUNDS (Per Leg)
+        # -------------------------------------------------------------------------
+        blocked_price_bounds = False
+        if up_price < self.MIN_LEG_PRICE or up_price > self.MAX_LEG_PRICE:
+            blocked_price_bounds = True
+            return {
+                'action': 'IDLE',
+                'reason': f'SKIP_PRICE_OUT_OF_BOUNDS: UP {up_price:.2f} (Limits: {self.MIN_LEG_PRICE}-{self.MAX_LEG_PRICE})',
+                'blocked_maker': False,
+                'blocked_price_bounds': True,
+                'near_resolution_blocked': False,
+                'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC
+            }
+            
+        if down_price < self.MIN_LEG_PRICE or down_price > self.MAX_LEG_PRICE:
+            blocked_price_bounds = True
+            return {
+                'action': 'IDLE',
+                'reason': f'SKIP_PRICE_OUT_OF_BOUNDS: DOWN {down_price:.2f} (Limits: {self.MIN_LEG_PRICE}-{self.MAX_LEG_PRICE})',
+                'blocked_maker': False,
+                'blocked_price_bounds': True,
+                'near_resolution_blocked': False,
+                'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC
+            }
+
+        # -------------------------------------------------------------------------
+        # 2) PROFIT CHECK (Profit per share)
+        # -------------------------------------------------------------------------
+        profit_both = 1.0 - (up_price + down_price)
+        blocked_low_profit = False
+        if profit_both < self.MIN_PROFIT_PER_SHARE:
+            blocked_low_profit = True
+            return {
+                'action': 'IDLE',
+                'reason': f'SKIP_LOW_PROFIT: Profit {profit_both:.3f} < {self.MIN_PROFIT_PER_SHARE}',
+                'blocked_maker': False,
+                'blocked_low_profit': True,
+                'near_resolution_blocked': False,
+                'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC,
+                'profit_both': profit_both
+            }
+
         # Check sum constraint
         if up_price + down_price > self.MAX_SUM_PRICE:
             return {
                 'action': 'IDLE',
                 'reason': f'Sum too high: {up_price:.2f} + {down_price:.2f} = {up_price + down_price:.2f} > {self.MAX_SUM_PRICE}',
-                'blocked_maker': False
+                'blocked_maker': False,
+                'near_resolution_blocked': False,
+                'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC
             }
 
         # MAKER GUARD: Strict check that limit_price < best_ask
@@ -111,7 +195,9 @@ class StraddleArbStrategy:
             return {
                 'action': 'IDLE',
                 'reason': f'MAKER_BLOCK: UP price {up_price:.2f} >= ask {up_ask:.2f}',
-                'blocked_maker': True
+                'blocked_maker': True,
+                'near_resolution_blocked': False,
+                'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC
             }
 
         if down_price >= down_ask:
@@ -119,7 +205,9 @@ class StraddleArbStrategy:
             return {
                 'action': 'IDLE',
                 'reason': f'MAKER_BLOCK: DOWN price {down_price:.2f} >= ask {down_ask:.2f}',
-                'blocked_maker': True
+                'blocked_maker': True,
+                'near_resolution_blocked': False,
+                'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC
             }
 
         # SIZE OPTIMIZATION: Find optimal size with EV maximization
@@ -128,7 +216,8 @@ class StraddleArbStrategy:
             down_price=down_price,
             bankroll_usd=self.bankroll_usd,
             available_balance=available_balance,
-            liquidity_depth=liquidity_depth
+            liquidity_depth=liquidity_depth,
+            test_mode=test_mode
         )
 
         if optimal_size == 0:
@@ -142,6 +231,13 @@ class StraddleArbStrategy:
         # Store optimal size for later use
         self.optimal_size = optimal_size
 
+        # Store snapshot values for consistent logging through the trade lifecycle
+        self.entry_up_px = up_price
+        self.entry_down_px = down_price
+        self.entry_sum_px = up_price + down_price
+        self.entry_profit = profit_both
+        self.entry_max_leg_price = max(up_price, down_price)
+
         return {
             'action': 'ENTER',
             'up_price': up_price,
@@ -153,7 +249,12 @@ class StraddleArbStrategy:
             'intended_price_down': intended_down_price,
             'rounded_price_down': down_price,
             'blocked_maker': False,
-            'sizing_debug': sizing_debug
+            'near_resolution_blocked': False,
+            'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC,
+            'sizing_debug': sizing_debug,
+            'profit_both': profit_both,
+            'price_bounds_ok': True,
+            'profit_ok': True
         }
 
     def on_orders_placed(self, up_order_id: str, down_order_id: str, actual_size: Optional[int] = None):
@@ -190,13 +291,40 @@ class StraddleArbStrategy:
         self.one_leg_fill_time = fill_time
         self.state = StraddleState.ONE_LEG_FILLED
 
-    def should_cancel_timeout(self) -> Tuple[bool, Optional[str], str]:
+    def on_order_canceled(self, order_id: str):
+        """Called when an order is cancelled."""
+        if order_id == self.up_order_id:
+            self.up_order_id = None
+        elif order_id == self.down_order_id:
+            self.down_order_id = None
+            
+        # If both orders are gone and no fills, reset to IDLE
+        if not self.up_order_id and not self.down_order_id:
+            if not self.up_filled and not self.down_filled:
+                self.state = StraddleState.IDLE
+
+
+    def should_cancel_timeout(self, time_remaining: float) -> Tuple[bool, Optional[str], str]:
         """
         Check if any open orders should be cancelled due to timeout.
+
+        Args:
+            time_remaining: Time remaining until market resolution
 
         Returns: (should_cancel, order_id, reason)
         """
         now = time.time()
+
+        # FORCE FLATTEN: If near resolution and one leg filled, cancel unfilled immediately
+        if self.state == StraddleState.ORDERS_OPEN and time_remaining < self.FORCE_FLATTEN_SEC:
+            if self.up_filled and not self.down_filled and self.down_order_id:
+                reason = f'FORCE_FLATTEN: {time_remaining:.0f}s < {self.FORCE_FLATTEN_SEC}s cutoff'
+                self._last_cancel_reason = reason
+                return True, self.down_order_id, reason
+            elif self.down_filled and not self.up_filled and self.up_order_id:
+                reason = f'FORCE_FLATTEN: {time_remaining:.0f}s < {self.FORCE_FLATTEN_SEC}s cutoff'
+                self._last_cancel_reason = reason
+                return True, self.up_order_id, reason
 
         if self.state == StraddleState.ORDERS_OPEN:
             if self.up_order_id and not self.up_filled:
@@ -213,14 +341,28 @@ class StraddleArbStrategy:
 
         return False, None, ''
 
-    def should_unwind_one_leg(self) -> Tuple[bool, str, str]:
+    def should_unwind_one_leg(self, time_remaining: float) -> Tuple[bool, str, str]:
         """
         Check if we should unwind the filled leg due to one-leg risk guard.
+
+        Args:
+            time_remaining: Time remaining until market resolution
 
         Returns: (should_unwind, leg_to_unwind, reason)
         """
         if self.state != StraddleState.ONE_LEG_FILLED:
             return False, '', ''
+
+        # FORCE FLATTEN: If near resolution, unwind immediately without timeout
+        if time_remaining < self.FORCE_FLATTEN_SEC:
+            if self.up_filled and not self.down_filled:
+                reason = f'FORCE_FLATTEN: {time_remaining:.0f}s < {self.FORCE_FLATTEN_SEC}s cutoff'
+                self._last_unwind_method = 'pending'
+                return True, 'UP', reason
+            elif self.down_filled and not self.up_filled:
+                reason = f'FORCE_FLATTEN: {time_remaining:.0f}s < {self.FORCE_FLATTEN_SEC}s cutoff'
+                self._last_unwind_method = 'pending'
+                return True, 'DOWN', reason
 
         now = time.time()
         time_since_fill = now - self.one_leg_fill_time
@@ -254,15 +396,34 @@ class StraddleArbStrategy:
             sum_px = up_px + down_px
             max_sum_price = self.MAX_SUM_PRICE
         else:
-            up_px = down_px = sum_px = 0.0
-            max_sum_price = 0.0
+            # Use persisted entry snapshot values if active
+            up_px = self.entry_up_px
+            down_px = self.entry_down_px
+            sum_px = self.entry_sum_px
+            max_sum_price = 0.0 # Not relevant once active
 
-        # Extract intended/rounded prices from enter_result if available
-        intended_price_up = enter_result.get('intended_price_up', 0.0) if enter_result else 0.0
-        rounded_price_up = enter_result.get('rounded_price_up', 0.0) if enter_result else 0.0
-        intended_price_down = enter_result.get('intended_price_down', 0.0) if enter_result else 0.0
-        rounded_price_down = enter_result.get('rounded_price_down', 0.0) if enter_result else 0.0
+        # Extract intended/rounded prices from enter_result if available, else from persist
+        intended_price_up = enter_result.get('intended_price_up', 0.0) if enter_result else self.entry_up_px
+        rounded_price_up = enter_result.get('rounded_price_up', 0.0) if enter_result else self.entry_up_px
+        intended_price_down = enter_result.get('intended_price_down', 0.0) if enter_result else self.entry_down_px
+        rounded_price_down = enter_result.get('rounded_price_down', 0.0) if enter_result else self.entry_down_px
         blocked_maker = enter_result.get('blocked_maker', False) if enter_result else False
+        near_resolution_blocked = enter_result.get('near_resolution_blocked', False) if enter_result else False
+        entry_cutoff_sec = enter_result.get('entry_cutoff_sec', self.ENTRY_CUTOFF_SEC) if enter_result else self.ENTRY_CUTOFF_SEC
+        
+        # New fields extraction
+        blocked_price_bounds = enter_result.get('blocked_price_bounds', False) if enter_result else False
+        blocked_low_profit = enter_result.get('blocked_low_profit', False) if enter_result else False
+        profit_both = enter_result.get('profit_both', 0.0) if enter_result else (self.entry_profit if self.state != StraddleState.IDLE else (1.0 - sum_px if self.state == StraddleState.IDLE else 0.0))
+        
+        # Status flags
+        price_bounds_ok = enter_result.get('price_bounds_ok', not blocked_price_bounds) if enter_result else (not blocked_price_bounds)
+        profit_ok = enter_result.get('profit_ok', not blocked_low_profit) if enter_result else (not blocked_low_profit)
+        
+        # Skip reason
+        skip_reason = enter_result.get('reason', '') if enter_result and enter_result['action'] == 'IDLE' else ''
+        if not skip_reason and blocked_price_bounds: skip_reason = "price_out_of_bounds"
+        if not skip_reason and blocked_low_profit: skip_reason = "low_profit"
 
         # Extract sizing information
         optimal_size = enter_result.get('size', 0) if enter_result else self.optimal_size
@@ -272,8 +433,27 @@ class StraddleArbStrategy:
         state = self.state.value
         cancel_reason = getattr(self, '_last_cancel_reason', '')
         unwind_method = getattr(self, '_last_unwind_method', '')
-        unwind_price = getattr(self, '_last_unwind_price', 0.0)
         unwind_result = getattr(self, '_last_unwind_result', '')
+        taker_path_attempted = getattr(self, '_taker_path_attempted', False)
+
+        # Force taker_path_attempted to False in test_mode (redundant safety)
+        if test_mode:
+            taker_path_attempted = False
+
+        # Near resolution safety tracking
+        force_flatten = "FORCE_FLATTEN" in cancel_reason or "FORCE_FLATTEN" in unwind_method if unwind_method else False
+        force_flatten_sec = self.FORCE_FLATTEN_SEC
+
+        # Extract sizing information
+        size_chosen = sizing_debug.get('size_chosen', 0) if sizing_debug else 0
+        size_max_usd = sizing_debug.get('size_max_usd', 0) if sizing_debug else 0
+        size_max_final = sizing_debug.get('size_max_final', 0) if sizing_debug else 0
+        usd_per_market_cap = sizing_debug.get('usd_per_market_cap', self.MAX_USD_PER_MARKET) if sizing_debug else self.MAX_USD_PER_MARKET
+        straddle_notional_per_share = sizing_debug.get('straddle_notional_per_share', 0.0) if sizing_debug else 0.0
+        size_block_reason = sizing_debug.get('size_block_reason', '') if sizing_debug else ''
+        test_mode = sizing_debug.get('test_mode', False) if sizing_debug else False
+        used_test_preset = sizing_debug.get('used_test_preset', False) if sizing_debug else False
+        test_preset_candidate = sizing_debug.get('test_preset_candidate', 0) if sizing_debug else 0
 
         return {
             'timestamp': now_ts,
@@ -303,5 +483,30 @@ class StraddleArbStrategy:
             'cancel_reason': cancel_reason,
             'unwind_method': unwind_method,
             'unwind_price': unwind_price,
-            'unwind_result': unwind_result
+            'unwind_result': unwind_result,
+            'optimal_size': optimal_size,
+            'actual_size': actual_size,
+            'near_resolution_blocked': near_resolution_blocked,
+            'force_flatten': force_flatten,
+            'entry_cutoff_sec': entry_cutoff_sec,
+            'force_flatten_sec': force_flatten_sec,
+            'size_chosen': size_chosen,
+            'size_max_usd': size_max_usd,
+            'size_max_final': size_max_final,
+            'usd_per_market_cap': usd_per_market_cap,
+            'straddle_notional_per_share': straddle_notional_per_share,
+            'size_block_reason': size_block_reason,
+            'test_mode': test_mode,
+            'used_test_preset': used_test_preset,
+            'test_preset_candidate': test_preset_candidate,
+            # New logging fields
+            'min_leg_price': self.MIN_LEG_PRICE,
+            'max_leg_price': self.MAX_LEG_PRICE,
+            'min_profit_per_share': self.MIN_PROFIT_PER_SHARE,
+            'profit_both': profit_both,
+            'price_bounds_ok': price_bounds_ok,
+            'profit_ok': profit_ok,
+            'blocked_price_bounds': blocked_price_bounds,
+            'blocked_low_profit': blocked_low_profit,
+            'taker_path_attempted': taker_path_attempted
         }

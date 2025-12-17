@@ -1,0 +1,15 @@
+timestamp,slug,pnl,outcome,size,details
+2025-12-15 21:15:01,eth-updown-15m-1765832400,0.0,SKIPPED,0,Market expired or preconditions not met
+2025-12-15 21:30:00,eth-updown-15m-1765833300,0.45,FULL_STRADDLE,15,Bought UP@0.51 DOWN@0.46
+2025-12-15 21:30:22,eth-updown-15m-1765834200,0.003,UNWOUND,15,Unwound DOWN @ 0.48 (Entry 0.48)
+2025-12-15 22:00:01,eth-updown-15m-1765835100,0.3,FULL_STRADDLE,15,Bought UP@0.51 DOWN@0.47
+2025-12-15 22:15:00,eth-updown-15m-1765836000,0.45,FULL_STRADDLE,15,Bought UP@0.46 DOWN@0.51
+2025-12-15 22:19:48,eth-updown-15m-1765836900,-6.6,UNWOUND,15,Unwound DOWN @ 0.00 (Entry 0.44)
+2025-12-15 22:45:00,eth-updown-15m-1765837800,0.0,SKIPPED,0,Market expired or preconditions not met
+2025-12-15 23:15:01,eth-updown-15m-1765839600,0.0,SKIPPED,0,Market expired or preconditions not met
+2025-12-17 00:45:01,eth-updown-15m-1765931400,10.0,FULL_STRADDLE,10.0,Bought UP@0.00 DOWN@0.00
+2025-12-17 15:00:00,eth-updown-15m-1765982700,0.0,SKIPPED,0.0,Market expired or preconditions not met
+2025-12-17 15:15:01,eth-updown-15m-1765983600,0.0,SKIPPED,0.0,Market expired or preconditions not met
+2025-12-17 15:15:01,eth-updown-15m-1765983600,-2.25,UNWOUND,5,Unwound UP @ 0.00 (Entry 0.45)
+2025-12-17 15:30:00,eth-updown-15m-1765984500,0.15,FULL_STRADDLE,5,Bought UP@0.42 DOWN@0.55
+2025-12-17 15:30:00,eth-updown-15m-1765984500,-2.25,UNWOUND,5,Unwound UP @ 0.00 (Entry 0.45)

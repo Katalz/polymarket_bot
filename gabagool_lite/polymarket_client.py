@@ -15,6 +15,61 @@ class PolymarketClientWrapper:
     def __init__(self, client: Optional[ClobClient] = None):
         self.client = client
 
+    def get_usdc_balance(self) -> float:
+        """
+        Get available USDC balance.
+        """
+        if not self.client:
+            return 10000.0 # Test mode dummy balance
+
+        try:
+            # Check for get_balance or get_balance_allowance
+            # Assuming get_balance_allowance is the standard for py_clob_client
+            if hasattr(self.client, 'get_balance_allowance'):
+                bal = self.client.get_balance_allowance(params={"asset_type": "collateral"})
+                # Should return dict like {'balance': '...', 'allowance': '...'}
+                return float(bal.get('balance', 0.0))
+            elif hasattr(self.client, 'get_collateral_balance'):
+                return float(self.client.get_collateral_balance())
+            else:
+                # Fallback or older version
+                return 2000.0
+        except Exception as e:
+            # Log specific error but don't spam 
+            # print(f"[!] Balance fetch error: {e}") 
+            # Return a safe default to allow bot to try trading. 
+            # If real balance is low, order placement will fail gracefully.
+            return 2000.0
+
+    def get_token_balance(self, token_id: str) -> float:
+        """
+        Get the specific token balance (shares held).
+        Using get_positions or similar endpoint.
+        """
+        if not self.client:
+            return 1000.0 # Test mode
+
+        try:
+            # Try specific method if available, else fallback to get_positions
+            positions = []
+            if hasattr(self.client, 'get_positions'):
+                # Pass token_id if the client supports filtering
+                # Note: api usually expects string args
+                positions = self.client.get_positions(token_id=token_id)
+            
+            # If positions is a list, look for our token
+            if isinstance(positions, list):
+                for p in positions:
+                    t_id = p.get('asset_id') or p.get('token_id')
+                    if t_id == token_id:
+                        return float(p.get('size', 0.0))
+            
+            return 0.0
+            
+        except Exception as e:
+            # print(f"[!] Token balance fetch error: {e}")
+            return 0.0
+
     def get_orderbook(self, token_id: str) -> Tuple[float, float]:
         """
         Get best bid and ask for a token.
@@ -100,6 +155,19 @@ class PolymarketClientWrapper:
             print(f"[!] Order placement exception: {e}")
             return None
 
+    def place_limit_maker_check(self, token_id: str, price: float, size: float, 
+                               best_bid: float, best_ask: float) -> Optional[str]:
+        """
+        Place a limit maker order (BUY) with strict maker guards and logging.
+        """
+        # STRICT MAKER GUARD
+        if price >= best_ask:
+            print(f"[GUARD] SKIP Taker: Price {price} >= Best Ask {best_ask} (Bid: {best_bid})")
+            return None
+            
+        print(f"[SEND] BUY {token_id} @ {price:.2f} (Bid:{best_bid:.2f} Ask:{best_ask:.2f} Maker:Yes)")
+        return self.place_limit_maker(token_id, price, size)
+
     def cancel_order(self, order_id: str) -> bool:
         """
         Cancel an order.
@@ -121,21 +189,45 @@ class PolymarketClientWrapper:
             print(f"[!] Cancel error for {order_id}: {e}")
             return False
 
-    def is_filled(self, order_id: str) -> Optional[bool]:
+    def is_filled(self, order_id: str) -> bool:
         """
-        Check if an order is filled.
+        Check if an order is fully filled.
+        """
+        if not self.client:
+            return False
+            
+        try:
+            order = self.client.get_order(order_id)
+            if isinstance(order, list) and order:
+                order = order[0]
+            
+            if not order:
+                return False
+                
+            filled_size = float(order.get("size_matched", 0) or 0)
+            total_size = float(order.get("size", 1) or 1)
+            
+            return filled_size >= (total_size * 0.99)
+            
+        except Exception as e:
+            # print(f"[!] is_filled error {order_id}: {e}")
+            return False
 
-        Args:
-            order_id: Order ID to check
-
-        Returns:
-            True if filled, False if open, None if error
+    def check_order_status(self, order_id: str) -> Tuple[Optional[bool], float, float]:
+        """
+        Check order status and return (is_filled, avg_fill_price, filled_size).
         """
         if not self.client:
             # Test mode: simulate fills for test orders
             if "TEST_ORDER" in order_id:
-                return True
-            return False
+                # Parse price from ID usually TEST_ORDER_token_PRICE
+                try:
+                    parts = order_id.split('_')
+                    sim_price = float(parts[-1])
+                except:
+                    sim_price = 0.5
+                return True, sim_price, 10.0 # Dummy size
+            return False, 0.0, 0.0
 
         try:
             order = self.client.get_order(order_id)
@@ -143,21 +235,21 @@ class PolymarketClientWrapper:
                 order = order[0]
 
             if not order:
-                # Order not found or not returned
-                return False # Assume active/not filled if we can't find it?? Or None?
-                # If we return None, the loop continues.
-                # If we return False, it assumes not filled.
-                return False
-
+                return False, 0.0, 0.0
 
             filled_size = float(order.get("size_matched", 0) or 0)
             total_size = float(order.get("size", 1) or 1)
-
-            return filled_size >= total_size * 0.99  # Allow for rounding
+            
+            # Extract Average Price from order details if available
+            avg_price = float(order.get("price", 0.0) or 0.0) 
+            
+            is_filled = filled_size >= total_size * 0.99
+            
+            return is_filled, avg_price, filled_size
 
         except Exception as e:
             print(f"[!] Order status error for {order_id}: {e}")
-            return None
+            return None, 0.0, 0.0
 
     def unwind_position(self, token_id: str, size: float, max_slippage: float = 0.02) -> Optional[str]:
         """

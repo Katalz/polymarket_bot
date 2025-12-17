@@ -21,6 +21,7 @@ from gabagool_lite.straddle_strategy import StraddleArbStrategy
 from gabagool_lite.polymarket_client import PolymarketClientWrapper
 from gabagool_lite.size_optimizer import SizeOptimizer, SizingConfig
 from gabagool_lite.utils_time import compute_time_remaining
+from gabagool_lite.straddle_strategy_reconstruct import StraddleReconstructStrategy
 
 # CONSTANTS
 HOST = "https://clob.polymarket.com"
@@ -41,6 +42,12 @@ SIZING_CONFIG = SizingConfig(
     test_size_shares=15, # Average size for test mode
     MAX_USD_PER_MARKET=15.0 # Max USD exposure per market (Total $15)
 )
+
+# EXECUTION CONFIG
+# Allow setting via env var OR command line arg "reconstruct"
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "standard").lower()
+if "reconstruct" in sys.argv:
+    EXECUTION_MODE = "reconstruct"
 
 # ---------------- UTILS: PERSISTENCE ---------------- #
 
@@ -390,13 +397,22 @@ def run():
                 if has_traded:
                     print(f"[STATE] Market {slug} already traded.")
 
-                # Initialize strategy with sizing optimizer
-                strategy = StraddleArbStrategy(
-                    slug=slug,
-                    has_traded=has_traded,
-                    size_optimizer=size_optimizer,
-                    bankroll_usd=BANKROLL_USD
-                )
+                # Initialize Strategy based on Mode
+                if EXECUTION_MODE == "reconstruct":
+                    print(f"[INIT] Using RECONSTRUCT strategy for {slug}")
+                    strategy = StraddleReconstructStrategy(
+                        slug=slug,
+                        has_traded=has_traded,
+                        size_optimizer=size_optimizer,
+                        bankroll_usd=BANKROLL_USD
+                    )
+                else:
+                    strategy = StraddleArbStrategy(
+                        slug=slug,
+                        has_traded=has_traded,
+                        size_optimizer=size_optimizer,
+                        bankroll_usd=BANKROLL_USD
+                    )
 
                 # Setup log file with header if not exists
                 log_file = f"{LOG_FILE_PREFIX}_{slug}.csv"
@@ -418,7 +434,11 @@ def run():
                             "taker_path_attempted", "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                             "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
                             "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                            "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                            "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                            "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                            "entry_sum_target", "initial_edge_per_share",
+                            "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                            "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
                         ])
                         writer.writeheader()
 
@@ -432,7 +452,7 @@ def run():
         time_remaining = compute_time_remaining(current_market["slug"], now)
         if time_remaining <= 0:
             print("[MARKET] Expired. Switching to next market immediately.")
-            if current_market and strategy:
+            if current_market and strategy and not getattr(strategy, "has_printed_done", False):
                  log_market_summary(strategy, current_market)
             current_market = None
             strategy = None
@@ -452,7 +472,7 @@ def run():
 
         # Strategy tick
         enter_result = None
-        if strategy.state.value == "IDLE":
+        if strategy.state.value in ["IDLE", "ONE_LEG_INVENTORY"]:
             # Try to enter straddle with sizing optimization
             # Note: For available_balance, we'd need to query actual balance from Polymarket
             # For now, using a conservative estimate
@@ -469,6 +489,7 @@ def run():
                 test_mode=USE_TEST_SIZING
             )
 
+            sizing_debug = {}
             if enter_result["action"] == "ENTER":
                 optimal_size = enter_result.get("size", 1)
                 sizing_debug = enter_result.get("sizing_debug", {})
@@ -476,23 +497,49 @@ def run():
                 if not DRY_RUN:
                     print(f"[EXEC] Placing straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f} Size={optimal_size}")
 
-                    up_order_id = pm_wrapper.place_limit_maker(current_market["up_token_id"],
-                                                             enter_result["up_price"], optimal_size)
-                    down_order_id = pm_wrapper.place_limit_maker(current_market["down_token_id"],
-                                                                enter_result["down_price"], optimal_size)
+                    up_oid = None
+                    down_oid = None
 
-                    if up_order_id and down_order_id:
-                        strategy.on_orders_placed(up_order_id, down_order_id, optimal_size)
-                        print(f"[OK] Orders placed: UP={up_order_id}, DOWN={down_order_id}, Size={optimal_size}")
-                        if 'best_ev' in sizing_debug:
-                            print(".2f")
+                    # Handle Asymmetric Sizing (Reconstruct Mode)
+                    up_size = enter_result.get('up_size', optimal_size)
+                    down_size = enter_result.get('down_size', optimal_size)
+                    
+                    if up_size > 0:
+                        up_oid = pm_wrapper.place_limit_maker(current_market["up_token_id"],
+                                                              enter_result["up_price"], up_size)
+                    if down_size > 0:
+                        down_oid = pm_wrapper.place_limit_maker(current_market["down_token_id"],
+                                                                 enter_result["down_price"], down_size)
+
+                    if up_oid or down_oid:
+                        strategy.on_orders_placed(
+                            up_oid, down_oid, max(up_size, down_size),
+                            up_px=enter_result.get('up_price', 0.0),
+                            down_px=enter_result.get('down_price', 0.0),
+                            is_reconstruct=enter_result.get('is_reconstruct', False)
+                        )
+                        print(f"[OK] Orders placed: UP={up_oid} ({up_size}), DOWN={down_oid} ({down_size})")
                     else:
-                        print("[X] Order placement failed")
+                        print("[X] Order placement failed (No ID returned)")
                 else:
-                    print(f"[EXEC] (DRY) Would place straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f} Size={optimal_size}")
-                    # Simulate order placement for dry run
-                    # Simulate order placement for dry run
-                    strategy.on_orders_placed("DRY_UP", "DRY_DOWN", optimal_size)
+                     # DRY RUN BLOCK
+                     up_size = enter_result.get('up_size', optimal_size)
+                     down_size = enter_result.get('down_size', optimal_size)
+                     print(f"[EXEC] (DRY) Would place: UP@{enter_result['up_price']:.2f} (x{up_size}) DOWN@{enter_result['down_price']:.2f} (x{down_size})")
+                     strategy.on_orders_placed(
+                        "DRY_UP", "DRY_DOWN", max(up_size, down_size),
+                        up_px=enter_result.get('up_price', 0.0),
+                        down_px=enter_result.get('down_price', 0.0),
+                        is_reconstruct=enter_result.get('is_reconstruct', False)
+                     )
+
+            elif enter_result["action"] == "IDLE":
+                reason = enter_result.get('reason', '')
+                sum_px = up_bid + down_bid
+                if "Spread high" in reason or "CAP_FULL" in reason or "RECONSTRUCT_BLOCKED" in reason:
+                     max_sum = getattr(strategy, 'MAX_SUM_PRICE', 1.0)
+                     print(f"[SKIP] Spread: {sum_px:.2f} (Max {max_sum}) | Reason: {reason}")
+
 
                 # Force log ORDERS_OPEN state immediately after placement
                 log_data = strategy.get_log_data(
@@ -538,7 +585,13 @@ def run():
                         "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                         "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
                         "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                        "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                        "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                        # New Reconstruct Fields
+                        "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                        "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                        "entry_sum_target", "initial_edge_per_share",
+                        "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                        "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
                     ])
                     if not file_exists:
                         writer.writeheader()
@@ -561,49 +614,111 @@ def run():
                 strategy.on_order_canceled(order_id)
 
         # Check for one-leg management action
-        action_res = strategy.get_management_action(now, up_bid, up_ask, down_bid, down_ask)
+        action_res = strategy.get_management_action(now, up_bid, up_ask, down_bid, down_ask, time_remaining)
         action_type = action_res.get("action")
         
-        should_unwind = False
-        leg = None
-        reason = ""
-
         if action_type == "TIMEOUT_CUT":
-            should_unwind = True
-            reason = action_res.get("reason", "Timeout Cut")
-            # Determine leg to unwind (the filled one)
-            leg = "UP" if strategy.filled_up_shares > strategy.filled_down_shares else "DOWN"
+            # Transition to FLATTENING
+            strategy.state = strategy.state.FLATTENING
+            print(f"[UNWIND] Time Limit reached: {action_res.get('reason')}. Transitioning to FLATTENING.")
+            # Explicitly cancel open orders first
+            if strategy.up_order_id and not strategy.up_filled:
+                pm_wrapper.cancel_order(strategy.up_order_id)
+                strategy.on_order_canceled(strategy.up_order_id)
+                print(f"[UNWIND] Canceled UP order {strategy.up_order_id}")
+            if strategy.down_order_id and not strategy.down_filled:
+                pm_wrapper.cancel_order(strategy.down_order_id)
+                strategy.on_order_canceled(strategy.down_order_id)
+                print(f"[UNWIND] Canceled DOWN order {strategy.down_order_id}")
 
-        if should_unwind:
-            token_id = current_market["up_token_id"] if leg == "UP" else current_market["down_token_id"]
-            unwind_price = pm_wrapper.get_orderbook(token_id)[1] * (1.0 - 0.02)  # 2% slippage
+        elif action_type == "TAKER_COMPLETE":
+             # Execute Taker Buy to complete the straddle
+             leg = action_res.get("leg")
+             qty = action_res.get("qty")
+             price = action_res.get("price")
+             print(f"[BTC-BOT] [TAKER-COMPLETE] Attempting to buy {qty} of {leg} @ {price:.3f} to complete straddle.")
+             
+             # Cancel the maker order for this leg first if it exists
+             order_id_to_cancel = strategy.up_order_id if leg == "UP" else strategy.down_order_id
+             if order_id_to_cancel:
+                 pm_wrapper.cancel_order(order_id_to_cancel)
+                 strategy.on_order_canceled(order_id_to_cancel)
+             
+             token_id = current_market["up_token_id"] if leg == "UP" else current_market["down_token_id"]
+             
+             if not DRY_RUN:
+                 taker_oid = pm_wrapper.place_limit_maker(token_id, price + 0.05, qty) # +0.05 buffer for fill
+                 
+                 if taker_oid:
+                     print(f"[BTC-BOT] [TAKER-COMPLETE] Order {taker_oid} placed. Waiting for fill...")
+                     time.sleep(1.0)
+                     filled, _, _ = pm_wrapper.check_order_status(taker_oid)
+                     if filled:
+                          print("[BTC-BOT] [TAKER-COMPLETE] SUCCESS. Straddle completed.")
+                          if leg == "UP": strategy.filled_up_shares += qty
+                          else: strategy.filled_down_shares += qty
+                          strategy.state = strategy.state.STRADDLE_COMPLETE
+                     else:
+                          print("[BTC-BOT] [TAKER-COMPLETE] Failed to fill immediately. Cancelling...")
+                          pm_wrapper.cancel_order(taker_oid)
+             else:
+                 print(f"[BTC-BOT] [TAKER-COMPLETE] (DRY) Would buy {qty} {leg} @ {price}")
+                 strategy.state = strategy.state.STRADDLE_COMPLETE
 
-            if not DRY_RUN:
-                print(f"[UNWIND] Unwinding {leg}: {reason}")
-                unwind_order_id = pm_wrapper.unwind_position(token_id, 5.0, max_slippage=0.02)
-                unwind_success = unwind_order_id is not None
-                if unwind_success:
-                    print(f"[OK] Unwind order placed: {unwind_order_id}")
-                    if is_test_mode:
-                         strategy.on_unwind_attempted(leg, 'test_simulated_unwind', unwind_price, True)
+        # FLATTENING STATE HANDLER
+        if strategy.state.value == "FLATTENING":
+            # 1. Verify what we hold
+            # Note: strategy.filled_x_shares is 'ledger' truth, but we should verify if we want to be 100% sure
+            # For now, trust strategy ledger implies what we bought.
+            
+            leg_to_sell = None
+            if strategy.filled_up_shares > strategy.filled_down_shares:
+                leg_to_sell = "UP"
+                qty_to_sell = strategy.filled_up_shares - strategy.filled_down_shares
+                token_id = current_market["up_token_id"]
+            elif strategy.filled_down_shares > strategy.filled_up_shares:
+                leg_to_sell = "DOWN"
+                qty_to_sell = strategy.filled_down_shares - strategy.filled_up_shares
+                token_id = current_market["down_token_id"]
+            
+            if leg_to_sell and qty_to_sell > 0:
+                print(f"[FLATTENING] Attempting to sell {qty_to_sell} of {leg_to_sell}...")
+                
+                # Unwind Function (sells at best bid - slippage)
+                unwind_order_id = pm_wrapper.unwind_position(token_id, qty_to_sell, max_slippage=0.05) # Increased slippage for panic exit
+                
+                if unwind_order_id:
+                    print(f"[FLATTENING] Sell order placed: {unwind_order_id}. Waiting for fill...")
+                    # Update strategy: We assume it fills for now or we wait for next loop?
+                    # Problem: We need to know if it filled. 
+                    # If we use strict state machine, we should go to "UNWIND_PLACED" or check status.
+                    # Simplified: Check status next loop or just wait a bit.
+                    time.sleep(1.0) 
+                    is_filled, _, _ = pm_wrapper.check_order_status(unwind_order_id)
+                    if is_filled:
+                        print(f"[FLATTENING] Sell confirmed.")
+                        if leg_to_sell == "UP": strategy.filled_up_shares -= qty_to_sell
+                        else: strategy.filled_down_shares -= qty_to_sell
+                        
+                        strategy.state = strategy.state.DONE
+                        strategy.has_traded = True
+                        persisted_state[current_market["slug"]] = True
+                        save_state(persisted_state)
                     else:
-                         strategy.on_unwind_attempted(leg, 'taker_fallback', unwind_price, True)
+                         print(f"[FLATTENING] Sell order {unwind_order_id} not filled immediately. Retrying next tick.")
+                         # Make sure to cancel it before retrying if it's a Limit? 
+                         # unwind_position sends a Limit. If it doesn't fill immediately, it sits there.
+                         # We should cancel it to avoid double selling if we loop.
+                         pm_wrapper.cancel_order(unwind_order_id)
                 else:
-                    print(f"[X] Unwind order failed")
-                    if is_test_mode:
-                         strategy.on_unwind_attempted(leg, 'test_simulated_unwind', unwind_price, False)
-                    else:
-                         strategy.on_unwind_attempted(leg, 'taker_fallback', unwind_price, False)
-
-                # Mark as done after unwind attempt
-                strategy.state = strategy.state.DONE
-                persisted_state[current_market["slug"]] = True
-                save_state(persisted_state)
+                    print(f"[FLATTENING] Failed to place sell order. Retrying...")
             else:
-                print(f"[UNWIND] (DRY) Would unwind {leg}: {reason}")
-                strategy.on_unwind_attempted(leg, 'test_simulated_unwind', unwind_price, True)
-                strategy.state = strategy.state.DONE
-                strategy.has_traded = True
+                 # Nothing to sell?
+                 print(f"[FLATTENING] No net position to sell? {strategy.filled_up_shares} vs {strategy.filled_down_shares}")
+                 strategy.state = strategy.state.DONE
+                 strategy.has_traded = True
+                 persisted_state[current_market["slug"]] = True
+                 save_state(persisted_state)
 
         # Poll order status if we have active orders
         if strategy.up_order_id and not strategy.up_filled and not DRY_RUN:
@@ -643,8 +758,9 @@ def run():
         should_log_csv = (status not in ["IDLE", "DONE"]) or (now_ts - last_csv_log_time > 2.0)
         
         # Force log if DONE to capture final state
-        if status == "DONE":
-            should_log_csv = True
+        # Force log if DONE to capture final state (once), then rely on interval
+        if status == "DONE" and not getattr(strategy, "has_printed_done", False):
+             should_log_csv = True
         
         if should_log_csv:
             log_data = strategy.get_log_data(
@@ -690,7 +806,13 @@ def run():
                     "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                     "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
                     "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                    "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                    "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                    # New Reconstruct Fields
+                    "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                    "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                    "entry_sum_target", "initial_edge_per_share",
+                    "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                    "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
                 ])
                 if not file_exists:
                     writer.writeheader()
@@ -700,13 +822,13 @@ def run():
 
         # Break loop if DONE to prevent spamming logs (after final log)
         # Reset and continue instead of breaking process - allows picking up the next market
-        if strategy.state.value == "DONE":
+        # If DONE, just print once and continue monitoring until expiry
+        if strategy.state.value == "DONE" and not getattr(strategy, "has_printed_done", False):
             log_market_summary(strategy, current_market)
-            print(f"[DONE] Finished trading {current_market['slug']}. Resuming discovery...")
-            current_market = None
-            strategy = None
-            time.sleep(2)
-            continue
+            print(f"[DONE] Finished trading {current_market['slug']}. Continuing to log until expiry...")
+            strategy.has_printed_done = True
+
+        time.sleep(0.5)
 
         time.sleep(0.5)
 

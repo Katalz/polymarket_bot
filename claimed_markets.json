@@ -1,0 +1,637 @@
+{
+  "btc-updown-15m-1765809900": {
+    "timestamp": 1765811965,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765809000": {
+    "timestamp": 1765811966,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765808100": {
+    "timestamp": 1765811967,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765807200": {
+    "timestamp": 1765811967,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765806300": {
+    "timestamp": 1765811969,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765805400": {
+    "timestamp": 1765811970,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765804500": {
+    "timestamp": 1765811971,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765803600": {
+    "timestamp": 1765811972,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765802700": {
+    "timestamp": 1765811973,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765801800": {
+    "timestamp": 1765811974,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765800900": {
+    "timestamp": 1765811974,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765800000": {
+    "timestamp": 1765811975,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765799100": {
+    "timestamp": 1765811976,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765798200": {
+    "timestamp": 1765811977,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765797300": {
+    "timestamp": 1765811978,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765796400": {
+    "timestamp": 1765811979,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765795500": {
+    "timestamp": 1765811980,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765794600": {
+    "timestamp": 1765811981,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765793700": {
+    "timestamp": 1765811982,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765792800": {
+    "timestamp": 1765811983,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765791900": {
+    "timestamp": 1765811984,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765791000": {
+    "timestamp": 1765811985,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765790100": {
+    "timestamp": 1765811986,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765789200": {
+    "timestamp": 1765811987,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765788300": {
+    "timestamp": 1765811987,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765787400": {
+    "timestamp": 1765811988,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765786500": {
+    "timestamp": 1765811989,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765785600": {
+    "timestamp": 1765811990,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765784700": {
+    "timestamp": 1765811991,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765783800": {
+    "timestamp": 1765811992,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765782900": {
+    "timestamp": 1765811993,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765782000": {
+    "timestamp": 1765811994,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765781100": {
+    "timestamp": 1765811995,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765780200": {
+    "timestamp": 1765811996,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765779300": {
+    "timestamp": 1765811997,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765778400": {
+    "timestamp": 1765811997,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765777500": {
+    "timestamp": 1765811998,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765776600": {
+    "timestamp": 1765811999,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765775700": {
+    "timestamp": 1765812000,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765774800": {
+    "timestamp": 1765812002,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765773900": {
+    "timestamp": 1765812002,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765773000": {
+    "timestamp": 1765812003,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765772100": {
+    "timestamp": 1765812004,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765771200": {
+    "timestamp": 1765812005,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765770300": {
+    "timestamp": 1765812006,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765769400": {
+    "timestamp": 1765812007,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765768500": {
+    "timestamp": 1765812008,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765767600": {
+    "timestamp": 1765812009,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765766700": {
+    "timestamp": 1765812010,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765765800": {
+    "timestamp": 1765812011,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765764900": {
+    "timestamp": 1765812012,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765764000": {
+    "timestamp": 1765812013,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765763100": {
+    "timestamp": 1765812014,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765762200": {
+    "timestamp": 1765812015,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765761300": {
+    "timestamp": 1765812016,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765760400": {
+    "timestamp": 1765812016,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765759500": {
+    "timestamp": 1765812017,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765758600": {
+    "timestamp": 1765812018,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765757700": {
+    "timestamp": 1765812019,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765756800": {
+    "timestamp": 1765812020,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765755900": {
+    "timestamp": 1765812021,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765755000": {
+    "timestamp": 1765812022,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765754100": {
+    "timestamp": 1765812023,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765753200": {
+    "timestamp": 1765812024,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765752300": {
+    "timestamp": 1765812025,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765751400": {
+    "timestamp": 1765812026,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765750500": {
+    "timestamp": 1765812027,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765749600": {
+    "timestamp": 1765812027,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765748700": {
+    "timestamp": 1765812028,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765747800": {
+    "timestamp": 1765812029,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765746900": {
+    "timestamp": 1765812030,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765746000": {
+    "timestamp": 1765812031,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765745100": {
+    "timestamp": 1765812032,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765744200": {
+    "timestamp": 1765812033,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765743300": {
+    "timestamp": 1765812034,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765742400": {
+    "timestamp": 1765812035,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765741500": {
+    "timestamp": 1765812036,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765740600": {
+    "timestamp": 1765812037,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765739700": {
+    "timestamp": 1765812038,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765738800": {
+    "timestamp": 1765812039,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765737900": {
+    "timestamp": 1765812040,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765737000": {
+    "timestamp": 1765812041,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765736100": {
+    "timestamp": 1765812041,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765735200": {
+    "timestamp": 1765812042,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765734300": {
+    "timestamp": 1765812043,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765733400": {
+    "timestamp": 1765812044,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765732500": {
+    "timestamp": 1765812045,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765731600": {
+    "timestamp": 1765812046,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765730700": {
+    "timestamp": 1765812047,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765729800": {
+    "timestamp": 1765812048,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765728900": {
+    "timestamp": 1765812049,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765728000": {
+    "timestamp": 1765812050,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765727100": {
+    "timestamp": 1765812051,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765726200": {
+    "timestamp": 1765812052,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765725300": {
+    "timestamp": 1765812053,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765812600": {
+    "timestamp": 1765813854,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765811700": {
+    "timestamp": 1765813855,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765810800": {
+    "timestamp": 1765813856,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765816200": {
+    "timestamp": 1765817458,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765815300": {
+    "timestamp": 1765817459,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765814400": {
+    "timestamp": 1765817460,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765813500": {
+    "timestamp": 1765817461,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765818000": {
+    "timestamp": 1765819262,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765817100": {
+    "timestamp": 1765819263,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765818900": {
+    "timestamp": 1765821065,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765820700": {
+    "timestamp": 1765822867,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765819800": {
+    "timestamp": 1765822868,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765823400": {
+    "timestamp": 1765824669,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765822500": {
+    "timestamp": 1765824669,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765821600": {
+    "timestamp": 1765824670,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765825200": {
+    "timestamp": 1765826471,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765824300": {
+    "timestamp": 1765826472,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765827000": {
+    "timestamp": 1765828273,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765826100": {
+    "timestamp": 1765828274,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765828800": {
+    "timestamp": 1765830075,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765827900": {
+    "timestamp": 1765830075,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765830600": {
+    "timestamp": 1765831877,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765829700": {
+    "timestamp": 1765831877,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765832400": {
+    "timestamp": 1765833678,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765831500": {
+    "timestamp": 1765833679,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765834200": {
+    "timestamp": 1765835480,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765833300": {
+    "timestamp": 1765835481,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765836000": {
+    "timestamp": 1765837282,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765835100": {
+    "timestamp": 1765837283,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765837800": {
+    "timestamp": 1765839084,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765836900": {
+    "timestamp": 1765839085,
+    "payout": 0.0,
+    "resolved": true
+  },
+  "btc-updown-15m-1765839600": {
+    "timestamp": 1765840886,
+    "payout": 0.0,
+    "resolved": true
+  }
+}

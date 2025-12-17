@@ -222,14 +222,11 @@ class SizeOptimizer:
             size_max_usd = int(self.config.MAX_USD_PER_MARKET / straddle_notional_per_share)
             size_max_non_risk = min(size_max_non_risk, size_max_usd)
 
-            # Find rotating preset that fits
-            rotation_set = sorted(self.config.TEST_MODE_SIZES)
-            target_preset = rotation_set[self.test_rotation_index % len(rotation_set)]
+            # TEST MODE: Single fixed size for simplicity and safety
+            # Avoids rotating through sizes in rapid loops causing confusing logs
+            target_preset = self.config.test_size_shares
             
             # Apply constraints: min(target_preset, size_max_non_risk)
-            # User requirement: "choose sizes from a small set like [1, 5, 10] shares (or min(10, size_max))"
-            # We interpret this as: try target_preset, but cap at size_max_non_risk
-            
             size_max = min(target_preset, size_max_non_risk)
             
             # If constrained to 0, fail
@@ -240,13 +237,12 @@ class SizeOptimizer:
                     'size_max_usd': size_max_usd,
                     'size_max_non_risk': size_max_non_risk,
                     'target_preset': target_preset,
-                    'test_presets': rotation_set,
                     'size_block_reason': 'SKIP_NO_TEST_SIZE_FITS',
                     'test_mode': test_mode
                 }
             
-            # Increment rotation for next time we successfully pick a size
-            self.test_rotation_index += 1
+            # No rotation index increment here anymore
+
         else:
             # LIVE MODE: Risk-based sizing
             risk_budget_usd = bankroll_usd * self.config.risk_frac

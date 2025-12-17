@@ -37,9 +37,8 @@ SIZING_CONFIG = SizingConfig(
     L_one=0.03,          # One-leg loss per share (2% slippage + 1% fees/spread)
     k_up=200.0,          # Initial fill decay parameter for UP leg
     k_down=200.0,        # Initial fill decay parameter for DOWN leg
-    max_size_cap=1000,   # Relaxed share cap, led by USD cap
-    test_size_shares=15, # Average size for test mode
-    MAX_USD_PER_MARKET=15.0 # Max USD exposure per market (Total $15)
+    max_size_cap=1000,   # Hard cap on size per straddle
+    test_size_shares=10  # Fixed size for test mode (zero real risk)
 )
 
 # ---------------- UTILS: PERSISTENCE ---------------- #
@@ -413,12 +412,9 @@ def run():
                             "optimal_size", "actual_size",
                             "near_resolution_blocked", "force_flatten", "entry_cutoff_sec", "force_flatten_sec",
                             "size_chosen", "size_max_usd", "size_max_final", "usd_per_market_cap",
-                            "test_mode", "used_test_preset", "test_preset_candidate",
+                            "straddle_notional_per_share", "size_block_reason", "test_mode", "used_test_preset", "test_preset_candidate",
                             "min_leg_price", "max_leg_price", "min_profit_per_share", "profit_both", "price_bounds_ok", "profit_ok", "skip_reason", "blocked_price_bounds", "blocked_low_profit",
-                            "taker_path_attempted", "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
-                            "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
-                            "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                            "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                            "taker_path_attempted", "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send"
                         ])
                         writer.writeheader()
 
@@ -535,10 +531,7 @@ def run():
                         "min_leg_price", "max_leg_price", "min_profit_per_share",
                         "profit_both", "price_bounds_ok", "profit_ok",
                         "skip_reason", "blocked_price_bounds", "blocked_low_profit", "taker_path_attempted",
-                        "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
-                        "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
-                        "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                        "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                        "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send"
                     ])
                     if not file_exists:
                         writer.writeheader()
@@ -560,20 +553,8 @@ def run():
                 print(f"[TIMEOUT] (DRY) Would cancel {order_id}: {reason}")
                 strategy.on_order_canceled(order_id)
 
-        # Check for one-leg management action
-        action_res = strategy.get_management_action(now, up_bid, up_ask, down_bid, down_ask)
-        action_type = action_res.get("action")
-        
-        should_unwind = False
-        leg = None
-        reason = ""
-
-        if action_type == "TIMEOUT_CUT":
-            should_unwind = True
-            reason = action_res.get("reason", "Timeout Cut")
-            # Determine leg to unwind (the filled one)
-            leg = "UP" if strategy.filled_up_shares > strategy.filled_down_shares else "DOWN"
-
+        # Check for one-leg unwind
+        should_unwind, leg, reason = strategy.should_unwind_one_leg(time_remaining)
         if should_unwind:
             token_id = current_market["up_token_id"] if leg == "UP" else current_market["down_token_id"]
             unwind_price = pm_wrapper.get_orderbook(token_id)[1] * (1.0 - 0.02)  # 2% slippage
@@ -607,15 +588,15 @@ def run():
 
         # Poll order status if we have active orders
         if strategy.up_order_id and not strategy.up_filled and not DRY_RUN:
-            status, px, sz = pm_wrapper.check_order_status(strategy.up_order_id)
-            if status is True:
-                strategy.on_order_update(strategy.up_order_id, True, fill_price=px, filled_size=sz)
+            filled = pm_wrapper.is_filled(strategy.up_order_id)
+            if filled is True:
+                strategy.on_order_update(strategy.up_order_id, True)
                 print(f"[FILL] UP order filled")
 
         if strategy.down_order_id and not strategy.down_filled and not DRY_RUN:
-            status, px, sz = pm_wrapper.check_order_status(strategy.down_order_id)
-            if status is True:
-                strategy.on_order_update(strategy.down_order_id, True, fill_price=px, filled_size=sz)
+            filled = pm_wrapper.is_filled(strategy.down_order_id)
+            if filled is True:
+                strategy.on_order_update(strategy.down_order_id, True)
                 print(f"[FILL] DOWN order filled")
 
         # For dry run, simulate fills after some time
@@ -687,10 +668,7 @@ def run():
                     "min_leg_price", "max_leg_price", "min_profit_per_share",
                     "profit_both", "price_bounds_ok", "profit_ok",
                     "skip_reason", "blocked_price_bounds", "blocked_low_profit", "taker_path_attempted",
-                    "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
-                    "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
-                    "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                    "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                    "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send"
                 ])
                 if not file_exists:
                     writer.writeheader()

@@ -18,6 +18,7 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
 from gabagool_lite.straddle_strategy import StraddleArbStrategy
+from gabagool_lite.straddle_strategy_reconstruct import StraddleReconstructStrategy
 from gabagool_lite.polymarket_client import PolymarketClientWrapper
 from gabagool_lite.size_optimizer import SizeOptimizer, SizingConfig
 from gabagool_lite.utils_time import compute_time_remaining
@@ -41,6 +42,12 @@ SIZING_CONFIG = SizingConfig(
     test_size_shares=15, # Average size for test mode
     MAX_USD_PER_MARKET=15.0 # Max USD exposure per market (Total $15)
 )
+
+# EXECUTION CONFIG
+# Allow setting via env var OR command line arg "reconstruct"
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "standard").lower()
+if "reconstruct" in sys.argv:
+    EXECUTION_MODE = "reconstruct"
 
 # ---------------- UTILS: PERSISTENCE ---------------- #
 
@@ -391,12 +398,21 @@ def run():
                     print(f"[STATE] Market {slug} already traded.")
 
                 # Initialize strategy with sizing optimizer
-                strategy = StraddleArbStrategy(
-                    slug=slug,
-                    has_traded=has_traded,
-                    size_optimizer=size_optimizer,
-                    bankroll_usd=BANKROLL_USD
-                )
+                if EXECUTION_MODE == "reconstruct":
+                    print(f"[INIT] Using RECONSTRUCT strategy for {slug}")
+                    strategy = StraddleReconstructStrategy(
+                        slug=slug,
+                        has_traded=has_traded,
+                        size_optimizer=size_optimizer,
+                        bankroll_usd=BANKROLL_USD
+                    )
+                else:
+                    strategy = StraddleArbStrategy(
+                        slug=slug,
+                        has_traded=has_traded,
+                        size_optimizer=size_optimizer,
+                        bankroll_usd=BANKROLL_USD
+                    )
 
                 # Setup log file with header if not exists
                 log_file = f"{LOG_FILE_PREFIX}_{slug}.csv"
@@ -418,7 +434,12 @@ def run():
                             "taker_path_attempted", "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                             "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
                             "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                            "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                            "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                            "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                            "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                            "entry_sum_target", "initial_edge_per_share",
+                            "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                            "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
                         ])
                         writer.writeheader()
 
@@ -449,6 +470,24 @@ def run():
             print(f"[!] Orderbook error: {e}")
             time.sleep(1)
             continue
+            
+        # [SYNC] Synchronize State (Continuous)
+        # Only in reconstruct mode or if strategy supports it
+        if hasattr(strategy, "sync_state"):
+            try:
+                # Optimized: We might want to throttle this if it's too slow
+                # For now, "tout le temps" = every loop
+                up_bal = pm_wrapper.get_token_balance(current_market["up_token_id"])
+                down_bal = pm_wrapper.get_token_balance(current_market["down_token_id"])
+                
+                # HYBRID MODEL: Only sync if API returns valid data (not None)
+                # If API fails (None), we TRUST INTERNAL MEMORY and skip sync.
+                if up_bal is not None and down_bal is not None:
+                    strategy.sync_state(up_bal, down_bal)
+                # else: pass (keep memory)
+            except Exception as e:
+                # Don't crash main loop on sync error
+                pass
 
         # Strategy tick
         enter_result = None
@@ -538,15 +577,25 @@ def run():
                         "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                         "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
                         "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                        "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                        "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                        "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                        "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                        "entry_sum_target", "initial_edge_per_share",
+                        "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                        "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
                     ])
                     if not file_exists:
                         writer.writeheader()
                     writer.writerow(log_data)
                 last_csv_log_time = now
-
-            # Determine if we should use test sizing
-        # USE_TEST_SIZING defined at top of loop
+            
+            elif enter_result["action"] == "IDLE":
+                reason = enter_result.get('reason', '')
+                sum_px = up_bid + down_bid
+                if "Spread high" in reason or "CAP_FULL" in reason or "RECONSTRUCT_BLOCKED" in reason:
+                     max_sum = getattr(strategy, 'MAX_SUM_PRICE', 1.0)
+                     inv_s = f"{strategy.filled_up_shares:.1f}/{strategy.filled_down_shares:.1f}"
+                     print(f"[SKIP] Spread: {sum_px:.2f} (Max {max_sum}) | Inv: {inv_s} | Reason: {reason}")
 
 
         # Check for timeouts
@@ -776,7 +825,12 @@ def run():
                     "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                     "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
                     "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                    "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                    "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                    "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                    "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                    "entry_sum_target", "initial_edge_per_share",
+                    "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                    "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
                 ])
                 if not file_exists:
                     writer.writeheader()

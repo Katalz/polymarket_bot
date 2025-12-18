@@ -469,6 +469,23 @@ def run():
             print(f"[!] Orderbook error: {e}")
             time.sleep(1)
             continue
+            
+        # [SYNC] Synchronize State (Continuous)
+        # Only in reconstruct mode or if strategy supports it
+        if hasattr(strategy, "sync_state"):
+            try:
+                # Optimized: We might want to throttle this if it's too slow
+                # For now, "tout le temps" = every loop
+                up_bal = pm_wrapper.get_token_balance(current_market["up_token_id"])
+                down_bal = pm_wrapper.get_token_balance(current_market["down_token_id"])
+                
+                # HYBRID MODEL: Only sync if API returns valid data (not None)
+                # If API fails (None), we TRUST INTERNAL MEMORY and skip sync.
+                if up_bal is not None and down_bal is not None:
+                    strategy.sync_state(up_bal, down_bal)
+            except Exception as e:
+                # Don't crash main loop on sync error
+                pass
 
         # Strategy tick
         enter_result = None
@@ -538,7 +555,8 @@ def run():
                 sum_px = up_bid + down_bid
                 if "Spread high" in reason or "CAP_FULL" in reason or "RECONSTRUCT_BLOCKED" in reason:
                      max_sum = getattr(strategy, 'MAX_SUM_PRICE', 1.0)
-                     print(f"[SKIP] Spread: {sum_px:.2f} (Max {max_sum}) | Reason: {reason}")
+                     inv_s = f"{strategy.filled_up_shares:.1f}/{strategy.filled_down_shares:.1f}"
+                     print(f"[SKIP] Spread: {sum_px:.2f} (Max {max_sum}) | Inv: {inv_s} | Reason: {reason}")
 
 
                 # Force log ORDERS_OPEN state immediately after placement

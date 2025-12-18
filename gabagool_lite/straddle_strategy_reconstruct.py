@@ -41,6 +41,7 @@ class StraddleReconstructStrategy:
         self.MAX_TOTAL_SHARES = 50.0
         self.OneLegTimeout = 15.0 # Seconds to wait in one leg before cancelling unfilled
         self.MAX_SUM_PRICE = 0.98
+        self.rebalance_tolerance_shares = 0.1 # Tolerance for considering straddle "balanced"
 
         # Inventory
         self.filled_up_shares = 0.0
@@ -57,6 +58,8 @@ class StraddleReconstructStrategy:
         # One Leg Logic
         self.one_leg_start_ts = None
         self.last_cancel_ts = 0.0 # Throttling re-entry after cancel
+        self.last_fill_ts = 0.0 # Tracking last fill time for sync protection
+        self.SYNC_GRACE_PERIOD = 30.0 # Ignore API balance drops for 30s after fill
         
         # Logging Compatibility (for log_market_summary)
         self.entry_up_px = 0.0
@@ -83,7 +86,49 @@ class StraddleReconstructStrategy:
         self.last_reprice_ts = 0.0
         self.actual_size = 0.0 # Last entry size
         
-        print(f"[RECONSTRUCT] Init {self.slug}. Budget=${self.reconstruction_budget} Cap={self.MAX_TOTAL_SHARES}")
+        self.last_reconstruct_cost = 0.0
+        self.latest_reconstruct_debug = {}
+        
+        # Logging / Debug
+        self.last_reprice_ts = 0.0
+        self.actual_size = 0.0 # Last entry size
+        
+        print(f"[RECONSTRUCT] Init {self.slug}. Budget=${self.reconstruction_budget} Cap={self.MAX_TOTAL_SHARES}. Tolerance={self.rebalance_tolerance_shares}")
+    def sync_state(self, up_shares: float, down_shares: float):
+        """
+        Synchronize internal inventory with external source (e.g. Wallet/API).
+        This updates filled_up_shares/filled_down_shares to reflect reality.
+        """
+        now = time.time()
+        
+        # 🔴 Stale Sync Protection
+        # If the API tries to lower our inventory shortly after a fill, we ignore it.
+        # This prevents the "wiping" issue where API lag shows 0.0 balance.
+        
+        up_shares = float(up_shares)
+        down_shares = float(down_shares)
+        
+        is_grace_period = (now - self.last_fill_ts < self.SYNC_GRACE_PERIOD)
+        
+        # Check UP
+        if up_shares < self.filled_up_shares and is_grace_period:
+            # print(f"[SYNC] Ignoring UP drop {self.filled_up_shares}->{up_shares} (In Grace Period)")
+            up_shares = self.filled_up_shares
+            
+        # Check DOWN
+        if down_shares < self.filled_down_shares and is_grace_period:
+            # print(f"[SYNC] Ignoring DOWN drop {self.filled_down_shares}->{down_shares} (In Grace Period)")
+            down_shares = self.filled_down_shares
+
+        # Only update if changed to avoid log noise, or just update silently
+        if abs(self.filled_up_shares - up_shares) > 0.01 or abs(self.filled_down_shares - down_shares) > 0.01:
+            print(f"[SYNC] Updating inventory: UP {self.filled_up_shares:.1f}->{up_shares:.1f}, DOWN {self.filled_down_shares:.1f}->{down_shares:.1f}")
+            
+        self.filled_up_shares = up_shares
+        self.filled_down_shares = down_shares
+        
+        # Re-check state immediately after sync
+        self._check_state_after_update()
 
     def get_log_data(self, up_bid, up_ask, down_bid, down_ask, now_ts, enter_result=None, sizing_debug=None):
         """Map internal state to CSV fields expected by runner."""
@@ -237,6 +282,9 @@ class StraddleReconstructStrategy:
                     self.reconstruction_spent += cost
                     self.last_reconstruct_cost = cost
             
+            # Update last fill timestamp for sync protection
+            self.last_fill_ts = time.time()
+            
         self._check_state_after_update()
 
     def _check_state_after_update(self):
@@ -247,7 +295,7 @@ class StraddleReconstructStrategy:
             # Check inventory balance
             imbalance = self.filled_up_shares - self.filled_down_shares
             
-            if abs(imbalance) < 0.1:
+            if abs(imbalance) <= self.rebalance_tolerance_shares:
                 # Balanced
                 self.state = ReconstructState.IDLE
             else:
@@ -353,26 +401,28 @@ class StraddleReconstructStrategy:
         # Positive = More UP = Need DOWN
         # Negative = More DOWN = Need UP
         
-        is_one_leg = abs(imbalance) >= 0.1
+        is_one_leg = abs(imbalance) > self.rebalance_tolerance_shares
         
         if is_one_leg:
             # 🔴 Critical Point #2 — ONE_LEG_INVENTORY Lockdown
             # Use strict compute_reconstruct_orders logic
             
             # 🔴 Critical Point #2 — ONE_LEG_INVENTORY Lockdown (New Chunked/Budget Logic)
-            # 🔴 Critical Point #2 — ONE_LEG_INVENTORY Lockdown (New Chunked/Budget Logic)
             imbalance = self._compute_imbalance(self.filled_up_shares, self.filled_down_shares)
             chunk_base = min(self.RECONSTRUCT_CHUNK_SHARES, abs(imbalance))
             
-            if abs(imbalance) < 0.1:
+            # Additional Cap Check for Rebalance Size
+            cap_left = self.MAX_TOTAL_SHARES - total_shares
+            chunk = min(chunk_base, cap_left)
+
+            if abs(imbalance) <= self.rebalance_tolerance_shares:
                 return {'action': 'IDLE', 'reason': "RECONSTRUCT_BALANCED"}
                 
             b_up, b_down = 0.0, 0.0
             avg_other = 0.0
             px_missing_now = 0.0
-            chunk = chunk_base
             
-            if imbalance > 0.05: # Have UP, Need DOWN
+            if imbalance > self.rebalance_tolerance_shares: # Have UP, Need DOWN
                 # We hold UP, so avg_other is self.total_cost_up / filled_up
                 avg_other = self.total_cost_up / self.filled_up_shares if self.filled_up_shares > 0 else 0.5
                 px_missing_now = down_bid # Target Maker Bid
@@ -387,7 +437,7 @@ class StraddleReconstructStrategy:
                     if chunk < req_chunk:
                          chunk = req_chunk
                 b_down = chunk
-            elif imbalance < -0.05: # Have DOWN, Need UP
+            elif imbalance < -self.rebalance_tolerance_shares: # Have DOWN, Need UP
                 avg_other = self.total_cost_down / self.filled_down_shares if self.filled_down_shares > 0 else 0.5
                 px_missing_now = up_bid # Target Maker Bid
                 

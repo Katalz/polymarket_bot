@@ -64,11 +64,13 @@ class PolymarketClientWrapper:
                     if t_id == token_id:
                         return float(p.get('size', 0.0))
             
-            return 0.0
+            # If the token is not found in the list, returning None instead of 0.0 
+            # tells the caller that we couldn't verify the balance (possibly stale API).
+            return None
             
         except Exception as e:
             # print(f"[!] Token balance fetch error: {e}")
-            return 0.0
+            return None
 
     def get_orderbook(self, token_id: str) -> Tuple[float, float]:
         """

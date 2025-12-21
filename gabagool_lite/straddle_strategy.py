@@ -32,28 +32,45 @@ class StraddleArbStrategy:
 
     def __init__(self, slug: str, has_traded: bool = False,
                  size_optimizer: Optional[SizeOptimizer] = None,
-                 bankroll_usd: float = 10000.0):
+                 bankroll_usd: float = 10000.0,
+                 initial_state: Optional[Dict] = None):
         self.slug = slug
         self.has_traded = has_traded
         self.state = StraddleState.IDLE
         self.size_optimizer = size_optimizer or SizeOptimizer()
         self.bankroll_usd = bankroll_usd
+
+        # Persistence restoration
+        self.filled_up_shares = 0.0
+        self.filled_down_shares = 0.0
+        self.total_cost_up = 0.0
+        self.total_cost_down = 0.0
+        self.consecutive_zero_syncs = 0 # 🔴 Counter to prevent transient API lag wipes
+
+        if initial_state:
+            print(f"[INIT] Restoring detailed state for {self.slug}...")
+            self.filled_up_shares = float(initial_state.get("filled_up_shares", 0.0))
+            self.filled_down_shares = float(initial_state.get("filled_down_shares", 0.0))
+            self.total_cost_up = float(initial_state.get("total_cost_up", 0.0))
+            self.total_cost_down = float(initial_state.get("total_cost_down", 0.0))
+            self.has_traded = initial_state.get("has_traded", self.has_traded)
+            self._last_sz_up = float(initial_state.get("_last_sz_up", 0.0))
+            self._last_sz_down = float(initial_state.get("_last_sz_down", 0.0))
+            print(f"       Restored: Inv={self.filled_up_shares}/{self.filled_down_shares} Cost={self.total_cost_up}/{self.total_cost_down}")
         
         # H3: Signature
         print(f"[DEBUG_H3] Strategy Loaded: {self.slug} (Sig: {time.time()})")
 
         # SIZE LOCK VARIABLES (Strict Invariants)
         self.target_size_shares: float = 0.0
-        self.filled_up_shares: float = 0.0
-        self.filled_down_shares: float = 0.0
+        # self.filled_up_shares and self.filled_down_shares initialized above
         self.one_leg_start_ts = None
         self.unwind_in_flight = False # Idempotency flag
         
         # Orders tracking (The Ledger)
         self.up_order_id = None
         self.down_order_id = None
-        self.filled_up_shares = 0.0
-        self.filled_down_shares = 0.0
+        # self.filled_up_shares and self.filled_down_shares initialized above
         self.filled_up_price = 0.0
         self.filled_down_price = 0.0
         
@@ -67,9 +84,7 @@ class StraddleArbStrategy:
         self.ACTIVITY_TIMEOUT = 8.0
         self.PHASE1_DURATION = 6.0   # Maker Window (6s)
         self.ENTRY_AGGRESSIVENESS_TICKS = 0 # STRICT MAKER (0 ticks)
-        self.PHASE1_COOLDOWN_SEC = 10.0 # Cooldown on fail
-
-        self.PHASE1_COOLDOWN_SEC = 5.0
+        self.PHASE1_COOLDOWN_SEC = 5.0 # Cooldown on fail
 
         self.phase1_timeout_ts = 0.0 # Track last timeout for cooldown
 
@@ -117,6 +132,19 @@ class StraddleArbStrategy:
         self.ONE_LEG_PHASE_1_SEC = 20.0    # Phase 1: Stabilization (20s) HOLD
         self.ONE_LEG_PHASE_2_SEC = 60.0    # Phase 2: Construction (Wait)
         
+        
+        # 🔴 New Brake & Selectivity Mechanisms
+        self.ewma_sum_px = None
+        self.ewma_sample_count = 0
+        self.EWMA_ALPHA = 0.033 # ~60s window at 1 tick/sec
+        self.EWMA_WARMUP_SAMPLES = 60
+        
+        self.last_straddle_completion_ts = 0.0
+        self.EXPANSION_COOLDOWN_SEC = 30.0
+        
+        self.NEVER_REINFORCE_SUM_PX = 1.01
+        self.MAX_SKEW_RATIO = 2.0 # Max 2x size on one leg
+        
         # ONE-LEG DETERMINISTIC STATE MACHINE GLOBALS
         self.one_leg_cycle_count = None
         self.one_leg_initial_distance = 0.0
@@ -157,6 +185,8 @@ class StraddleArbStrategy:
         self.entry_down_px = 0.0
         self.entry_sum_px = 0.0
         self.entry_profit = 0.0
+        self.last_fill_ts = 0.0 # Tracking last fill time for sync protection
+        self.SYNC_GRACE_PERIOD = 60.0 # Ignore API balance drops for 60s after fill
         
         # Safety/Fallback defaults
         self.MAX_ONE_LEG_SEC_FAST = 30.0
@@ -169,25 +199,163 @@ class StraddleArbStrategy:
         self._last_reprice_reason = ""
         self.taker_fallback = True # User: taker_fallback = True
 
+    def get_log_data(self, up_bid, up_ask, down_bid, down_ask, now_ts, enter_result=None, sizing_debug=None):
+        """Map internal state to CSV fields expected by runner."""
+        
+        imbalance = self.filled_up_shares - self.filled_down_shares
+        total_inv = self.filled_up_shares + self.filled_down_shares
+        cap_left = self.MAX_USD_PER_MARKET - total_inv # Assuming MAX_USD_PER_MARKET is in shares or equivalent
+        
+        data = {
+            "decision": self.state.value,
+            "up_px": enter_result.get('up_price', 0) if enter_result else 0,
+            "down_px": enter_result.get('down_price', 0) if enter_result else 0,
+            "sum_px": up_bid + down_bid,
+            "max_sum_price": self.MAX_SUM_PRICE,
+            "optimal_size": enter_result.get('size', 0) if enter_result else 0,
+            "actual_size": self.actual_size,
+            "filled_up_shares": self.filled_up_shares,
+            "filled_down_shares": self.filled_down_shares,
+            "avg_cost_up": 0, # Not tracked in basic Arb
+            "avg_cost_down": 0,
+            "remaining_up": 0,
+            "remaining_down": 0,
+            
+            "skip_reason": enter_result.get('reason', '') if enter_result else '',
+            "cancel_reason": getattr(self, '_last_cancel_reason', ''),
+            "reprice_reason": f"Inv: {self.filled_up_shares:.1f}/{self.filled_down_shares:.1f} CapLeft: {cap_left:.1f}",
+            
+            "inv_up": self.filled_up_shares,
+            "inv_down": self.filled_down_shares,
+            "total_inventory": total_inv,
+            "cap_remaining": cap_left,
+            
+            # Selectivity Metrics
+            "ewma_sum_px": self.ewma_sum_px or 0.0,
+            "ewma_samples": self.ewma_sample_count,
+            "last_completion_ts": self.last_straddle_completion_ts,
+            "cooldown_remaining": max(0.0, self.EXPANSION_COOLDOWN_SEC - (time.time() - self.last_straddle_completion_ts)),
+        }
+        return data
+
+    def get_current_state(self) -> Dict:
+        """Returns the current state for persistence."""
+        return {
+            "has_traded": self.has_traded,
+            "filled_up_shares": self.filled_up_shares,
+            "filled_down_shares": self.filled_down_shares,
+            "total_cost_up": self.total_cost_up,
+            "total_cost_down": self.total_cost_down,
+            "up_order_id": self.up_order_id,
+            "down_order_id": self.down_order_id,
+            "_last_sz_up": getattr(self, "_last_sz_up", 0.0),
+            "_last_sz_down": getattr(self, "_last_sz_down", 0.0)
+        }
+
+    def sync_state(self, up_shares: float, down_shares: float):
+        """
+        Synchronize inventory with external source.
+        
+        [SKEPTICAL] Prevents API lag from wiping local fills by requiring consecutive zeros.
+        """
+        now = time.time()
+        up_shares = float(up_shares)
+        down_shares = float(down_shares)
+        
+        # 1. Grace Period Protection
+        is_grace_period = (now - self.last_fill_ts < self.SYNC_GRACE_PERIOD) or \
+                          (self.up_order_id is not None) or (self.down_order_id is not None)
+
+        if up_shares < self.filled_up_shares and is_grace_period:
+            up_shares = self.filled_up_shares
+        if down_shares < self.filled_down_shares and is_grace_period:
+            down_shares = self.filled_down_shares
+
+        # 2. Conservative Zeroing (The "Skeptical" Logic)
+        # If API says 0 but local ledger says we have positions, we wait for 5 consecutive zeros.
+        if up_shares < 0.1 and down_shares < 0.1 and (self.filled_up_shares > 1.0 or self.filled_down_shares > 1.0):
+            self.consecutive_zero_syncs += 1
+            if self.consecutive_zero_syncs < 10:
+                # print(f"[SYNC] Ignoring aggressive zero-out from API (Attempt {self.consecutive_zero_syncs}/10)")
+                up_shares = self.filled_up_shares
+                down_shares = self.filled_down_shares
+            else:
+                print(f"[SYNC] API Zero-balance confirmed after {self.consecutive_zero_syncs} attempts.")
+        else:
+            self.consecutive_zero_syncs = 0
+
+        # 3. Apply Updates
+        if abs(self.filled_up_shares - up_shares) > 0.01 or abs(self.filled_down_shares - down_shares) > 0.01:
+            print(f"[SYNC] Updating inventory: UP {self.filled_up_shares:.1f}->{up_shares:.1f}, DOWN {self.filled_down_shares:.1f}->{down_shares:.1f}")
+
+        self.filled_up_shares = up_shares
+        self.filled_down_shares = down_shares
+
     def on_order_update(self, order_id, filled, fill_price=0.0, filled_size=0.0):
         """
         Single Source of Truth update.
         Called by WebSocket or REST poller.
         """
-        price = fill_price # Alias
+        price = float(fill_price) # Alias
+        filled_size = float(filled_size)
 
-        # 1. Update quantities
+        # We track incremental cost basis
         if order_id == self.up_order_id:
-            self.filled_up_shares = float(filled_size)
-            if price > 0: self.filled_up_price = float(price)
-        elif order_id == self.down_order_id:
-            self.filled_down_shares = float(filled_size)
-            if price > 0: self.filled_down_price = float(price)
+            # How much NEWly filled?
+            new_fill = max(0.0, filled_size - getattr(self, '_last_sz_up', 0.0))
+            if new_fill > 0 and price > 0:
+                self.total_cost_up += new_fill * price
+                self.filled_up_shares += new_fill  # 🔴 Local Increment to prevent overbuy
+                self._last_sz_up = filled_size
+            
+            # Update inventory (This might be problematic if sync_state also runs, 
+            # but usually they converge)
+            # Actually, standard strategy assumes one active order at a time.
+            # We add the fill to the baseline if we wanted to be perfectly safe,
+            # but current logic uses self.filled_up_shares as total.
+            # If we call sync_state(API_BALANCE), it's the most robust.
+            
+            # IMPORTANT: For now, we trust the relative update from the order if sz > 0
+            if filled_size > 0:
+                if price > 0: self.filled_up_price = price
+            
+            if filled:
+                self.up_filled = True
+                self.up_order_id = None
+                self._last_sz_up = 0.0
 
-        # Update flags (Wait, target_size might be 0 if not set, but standard flow sets it)
+        elif order_id == self.down_order_id:
+            new_fill = max(0.0, filled_size - getattr(self, '_last_sz_down', 0.0))
+            if new_fill > 0 and price > 0:
+                self.total_cost_down += new_fill * price
+                self.filled_down_shares += new_fill  # 🔴 Local Increment to prevent overbuy
+                self._last_sz_down = filled_size
+
+            if filled_size > 0:
+                if price > 0: self.filled_down_price = price
+
+            if filled:
+                self.down_filled = True
+                self.down_order_id = None
+                self._last_sz_down = 0.0
+        
+        if filled_size > 0:
+            self.last_fill_ts = time.time()
+
+        # Update flags (Wait, target_size might be 0 if not set)
         if self.target_size_shares > 0:
             self.up_filled = (self.filled_up_shares >= self.target_size_shares - 0.1)
             self.down_filled = (self.filled_down_shares >= self.target_size_shares - 0.1)
+            
+            # 🔴 Track Straddle Completion for Cool-down
+            if self.up_filled and self.down_filled:
+                if self.state != StraddleState.DONE:
+                    # Transition to a 'finished' state or just trigger cooldown
+                    # In basic Arb, we don't always transition to DONE immediately 
+                    # but we should mark the completion time.
+                    if self.last_straddle_completion_ts == 0:
+                        print(f"[ARB] Straddle completion detected (Size: {self.target_size_shares})")
+                        self.last_straddle_completion_ts = time.time()
 
             
         # 2. Evaluate State
@@ -195,7 +363,7 @@ class StraddleArbStrategy:
         
         # Just in case we finished
         if (abs(self.filled_up_shares - self.target_size_shares) < 0.1 and 
-            abs(self.filled_down_shares - self.target_size_shares) < 0.1):
+            abs(self.filled_down_shares - self.target_size_shares) < 0.1 and self.target_size_shares > 0):
             self.state = StraddleState.STRADDLE_COMPLETE
             self.one_leg_start_ts = None
             return
@@ -404,42 +572,53 @@ class StraddleArbStrategy:
                    time_remaining: float, available_balance: Optional[float] = None,
                    liquidity_depth: Optional[float] = None, test_mode: bool = False) -> Dict[str, Any]:
         """
-        Check if we should enter straddle position with EV-optimized sizing.
-
-        Returns dict with:
-        - 'action': 'ENTER' or 'IDLE'
-        - 'up_price': float (if ENTER)
-        - 'down_price': float (if ENTER)
-        - 'size': int (if ENTER) - optimal size from EV optimization
-        - 'reason': str
-        - 'intended_price_up': float (for logging)
-        - 'rounded_price_up': float (for logging)
-        - 'intended_price_down': float (for logging)
-        - 'rounded_price_down': float (for logging)
-        - 'blocked_maker': bool (for logging)
-        - 'sizing_debug': dict (sizing optimization details)
+        Main decision logic with Smart Selective Brakes.
         """
+        now = time.time()
+        
+        # 🔴 EWMA Market Analysis & Data Validation
+        sum_px = up_ask + down_ask
+        if (up_ask > 0 and down_ask > 0) and (0.80 <= sum_px <= 1.20):
+            if self.ewma_sum_px is None:
+                self.ewma_sum_px = sum_px
+                self.ewma_sample_count = 1
+            else:
+                self.ewma_sum_px = (self.EWMA_ALPHA * sum_px) + ((1.0 - self.EWMA_ALPHA) * self.ewma_sum_px)
+                self.ewma_sample_count += 1
+
         if self.has_traded:
-            return {'action': 'IDLE', 'reason': 'Already traded this market', 'blocked_maker': False,
-                   'near_resolution_blocked': False, 'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC}
+            return {'action': 'IDLE', 'reason': 'Already traded this market'}
 
         if self.state != StraddleState.IDLE:
-            return {'action': 'IDLE', 'reason': f'Already in state {self.state.value}', 'blocked_maker': False,
-                   'near_resolution_blocked': False, 'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC}
+            return {'action': 'IDLE', 'reason': f'Already in state {self.state.value}'}
 
-        # Cooldown Check
-        if time.time() - self.phase1_timeout_ts < self.PHASE1_COOLDOWN_SEC:
-             return {
-                 'action': 'IDLE',
-                 'reason': f'COOLDOWN: Phase 1 Timeout ({self.PHASE1_COOLDOWN_SEC}s)',
-                 'blocked_maker': False,
-                 'near_resolution_blocked': False, 
-                 'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC
-             }
-
+        # 0. Basic Timing Guards
         if time_remaining <= 0:
-            return {'action': 'IDLE', 'reason': 'Market expired', 'blocked_maker': False,
-                   'near_resolution_blocked': False, 'entry_cutoff_sec': self.ENTRY_CUTOFF_SEC}
+            return {'action': 'IDLE', 'reason': 'Market expired'}
+            
+        if (time.time() - self.phase1_timeout_ts) < self.PHASE1_COOLDOWN_SEC:
+            return {'action': 'IDLE', 'reason': 'PHASE1_COOLDOWN_ACTIVE'}
+
+        # 1. Absolute Firebreak
+        if sum_px > self.NEVER_REINFORCE_SUM_PX:
+            return {'action': 'IDLE', 'reason': f'FIREBREAK_EXCEEDED ({sum_px:.2f} > {self.NEVER_REINFORCE_SUM_PX})'}
+
+        # 2. Cool-down (Only if expanding)
+        if self.filled_up_shares > 0 or self.filled_down_shares > 0:
+            time_since_done = time.time() - self.last_straddle_completion_ts
+            if time_since_done < self.EXPANSION_COOLDOWN_SEC:
+                return {'action': 'IDLE', 'reason': f'EXPANSION_COOLDOWN ({time_since_done:.1f}s)'}
+
+        # 3. EWMA Relative Edge
+        if self.filled_up_shares > 0 or self.filled_down_shares > 0:
+            if self.ewma_sample_count < self.EWMA_WARMUP_SAMPLES:
+                warmup_cap = 0.97
+                if sum_px > warmup_cap:
+                    return {'action': 'IDLE', 'reason': f'EWMA_WARMUP_ACTIVE ({self.ewma_sample_count}/60, Sum={sum_px:.2f})'}
+            else:
+                required_edge = self.ewma_sum_px - 0.005
+                if sum_px > required_edge:
+                    return {'action': 'IDLE', 'reason': f'EWMA_EDGE_INSUFFICIENT (Sum={sum_px:.2f} > {required_edge:.3f})'}
 
         # NEAR RESOLUTION SAFETY: Block new entries too close to resolution
         near_resolution_blocked = False
@@ -656,6 +835,7 @@ class StraddleArbStrategy:
         self.down_order_time = time.time()
         self.actual_size = actual_size or self.optimal_size
         self.state = StraddleState.ORDERS_OPEN
+        self.last_fill_ts = time.time() # Refresh grace period
         
         # RATE LIMIT LOCK
         if self.target_size_shares == 0:
@@ -673,19 +853,14 @@ class StraddleArbStrategy:
         elif order_id == self.down_order_id:
             self.down_order_id = None
             
+        # Refresh grace period to allow API to settle after cancellation
+        self.last_fill_ts = time.time()
+        
         # If both orders are gone and no fills, reset to IDLE
         if not self.up_order_id and not self.down_order_id:
             if not self.up_filled and not self.down_filled:
                 if self.state != StraddleState.STRADDLE_COMPLETE:
                      self.state = StraddleState.IDLE
-
-        elif order_id == self.down_order_id:
-            self.down_order_id = None
-            
-        # If both orders are gone and no fills, reset to IDLE
-        if not self.up_order_id and not self.down_order_id:
-            if not self.up_filled and not self.down_filled:
-                self.state = StraddleState.IDLE
 
 
     def should_cancel_timeout(self, time_remaining: float) -> Tuple[bool, Optional[str], str]:
@@ -966,6 +1141,8 @@ class StraddleArbStrategy:
             'min_leg_price': self.MIN_LEG_PRICE,
             'max_leg_price': self.MAX_LEG_PRICE,
             'min_profit_per_share': self.MIN_PROFIT_PER_SHARE,
+            'avg_cost_up': self.total_cost_up / self.filled_up_shares if self.filled_up_shares > 0 else 0.0,
+            'avg_cost_down': self.total_cost_down / self.filled_down_shares if self.filled_down_shares > 0 else 0.0,
             'profit_both': profit_both,
             'price_bounds_ok': price_bounds_ok,
             'profit_ok': profit_ok,

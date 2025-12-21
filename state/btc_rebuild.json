@@ -1,0 +1,26 @@
+{
+  "btc-updown-15m-1766063700": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "last_updated": 1766064442.1576781
+  },
+  "btc-updown-15m-1766064600": {
+    "has_traded": false,
+    "filled_up_shares": 5.0,
+    "filled_down_shares": 5.0,
+    "total_cost_up": 4.35,
+    "total_cost_down": 0.6,
+    "last_updated": 1766065202.3569686
+  },
+  "btc-updown-15m-1766065500": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 5.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 2.6,
+    "last_updated": 1766065556.2873795
+  }
+}

@@ -48,5 +48,133 @@
   "btc-updown-15m-1765834200": true,
   "btc-updown-15m-1765835100": true,
   "btc-updown-15m-1765836000": true,
-  "btc-updown-15m-1765836900": true
+  "btc-updown-15m-1765836900": true,
+  "btc-updown-15m-1766061900": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "last_updated": 1766062587.2729373
+  },
+  "btc-updown-15m-1766062800": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 5.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 1.7999999999999998,
+    "last_updated": 1766062836.1260507
+  },
+  "btc-updown-15m-1766068200": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 3.0100000000000002,
+    "total_cost_down": 16.349999999999998,
+    "reconstruction_spent": 0.0
+  },
+  "btc-updown-15m-1766069100": {
+    "has_traded": false,
+    "filled_up_shares": 23.0,
+    "filled_down_shares": 15.0,
+    "total_cost_up": 30.51,
+    "total_cost_down": 13.728304960000001,
+    "reconstruction_spent": 0.15000000000000013
+  },
+  "btc-updown-15m-1766103300": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0
+  },
+  "btc-updown-15m-1766104200": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0
+  },
+  "btc-updown-15m-1766105100": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0
+  },
+  "btc-updown-15m-1766106000": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0
+  },
+  "btc-updown-15m-1766106900": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0
+  },
+  "btc-updown-15m-1766107800": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0
+  },
+  "btc-updown-15m-1766139300": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0,
+    "up_order_id": null,
+    "down_order_id": null,
+    "_last_sz_up": 0.0,
+    "_last_sz_down": 0.0
+  },
+  "btc-updown-15m-1766140200": {
+    "has_traded": false,
+    "filled_up_shares": 50.0,
+    "filled_down_shares": 47.829318,
+    "total_cost_up": 29.3,
+    "total_cost_down": 20.013120379999997,
+    "reconstruction_spent": 1.4966330823314133,
+    "up_order_id": null,
+    "down_order_id": null,
+    "_last_sz_up": 0.0,
+    "_last_sz_down": 0.0
+  },
+  "btc-updown-15m-1766142000": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0,
+    "up_order_id": null,
+    "down_order_id": null,
+    "_last_sz_up": 0.0,
+    "_last_sz_down": 0.0
+  },
+  "btc-updown-15m-1766142900": {
+    "has_traded": false,
+    "filled_up_shares": 0.0,
+    "filled_down_shares": 0.0,
+    "total_cost_up": 0.0,
+    "total_cost_down": 0.0,
+    "reconstruction_spent": 0.0,
+    "up_order_id": null,
+    "down_order_id": null,
+    "_last_sz_up": 0.0,
+    "_last_sz_down": 0.0
+  }
 }

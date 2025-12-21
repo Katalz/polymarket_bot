@@ -29,16 +29,21 @@ class StraddleReconstructStrategy:
     - Hard cap of 10 shares total.
     """
 
-    def __init__(self, slug: str, has_traded: bool = False, size_optimizer=None, bankroll_usd: float = 10000.0):
+    def __init__(self, slug: str, has_traded: bool = False, size_optimizer=None, bankroll_usd: float = 10000.0, 
+                 initial_state: Optional[Dict] = None, max_usd_exposure: float = 15.0):
         self.slug = slug
         self.has_traded = has_traded # Used to prevent re-entry if strategy considers itself "DONE" for the market
         self.state = ReconstructState.IDLE
         
+        # Persistence Helpers (Last seen fill amounts for currently open orders)
+        self._last_sz_up = initial_state.get("_last_sz_up", 0.0) if initial_state else 0.0
+        self._last_sz_down = initial_state.get("_last_sz_down", 0.0) if initial_state else 0.0
+        
         # Params
         self.USD_PER_ORDER = 2.0
-        # Strict Cap 50 shares (UP + DOWN). 
-        # Allows Option B (Aggressive Reconstruct) to trigger: 10 + 5 existing = 15 cost.
-        self.MAX_TOTAL_SHARES = 50.0
+        # Strict USD Cap ($15.0). Lead by USD, fallback to shares.
+        self.MAX_USD_EXPOSURE = max_usd_exposure
+        self.MAX_TOTAL_SHARES = 60.0 # Higher share cap allowed if USD cap permits
         self.OneLegTimeout = 15.0 # Seconds to wait in one leg before cancelling unfilled
         self.MAX_SUM_PRICE = 0.98
         self.rebalance_tolerance_shares = 0.1 # Tolerance for considering straddle "balanced"
@@ -46,20 +51,34 @@ class StraddleReconstructStrategy:
         # Inventory
         self.filled_up_shares = 0.0
         self.filled_down_shares = 0.0
-        
+        self.total_cost_up = 0.0
+        self.total_cost_down = 0.0
+        self.reconstruction_spent = 0.0
+
         # Order Tracking
         self.up_order_id = None
         self.down_order_id = None
         self.up_filled = False
-        self.down_filled = False
         self.up_order_time = 0.0
         self.down_order_time = 0.0
+
+        if initial_state:
+            print(f"[INIT] Restoring detailed state for {self.slug}...")
+            self.filled_up_shares = float(initial_state.get("filled_up_shares", 0.0))
+            self.filled_down_shares = float(initial_state.get("filled_down_shares", 0.0))
+            self.total_cost_up = float(initial_state.get("total_cost_up", 0.0))
+            self.total_cost_down = float(initial_state.get("total_cost_down", 0.0))
+            self.reconstruction_spent = float(initial_state.get("reconstruction_spent", 0.0))
+            self.has_traded = initial_state.get("has_traded", self.has_traded)
+            self.up_order_id = initial_state.get("up_order_id")
+            self.down_order_id = initial_state.get("down_order_id")
+            print(f"       Restored: Inv={self.filled_up_shares}/{self.filled_down_shares} Orders={self.up_order_id}/{self.down_order_id}")
         
         # One Leg Logic
         self.one_leg_start_ts = None
         self.last_cancel_ts = 0.0 # Throttling re-entry after cancel
         self.last_fill_ts = 0.0 # Tracking last fill time for sync protection
-        self.SYNC_GRACE_PERIOD = 30.0 # Ignore API balance drops for 30s after fill
+        self.SYNC_GRACE_PERIOD = 180.0 # 🔴 Increased for Polymarket balance lag
         
         # Logging Compatibility (for log_market_summary)
         self.entry_up_px = 0.0
@@ -67,15 +86,11 @@ class StraddleReconstructStrategy:
         self.actual_size = 0.0
         self._last_unwind_price = 0.0
         
-        # 🔴 Reconstruction Budget State (New Logic)
+        # Reconstruction Budget State (Already initialized above for restoration)
         self.RECONSTRUCTION_BUDGET_USD = 50.0
         self.RECONSTRUCT_CHUNK_SHARES = 1.0 # Default 1, but user allows 2
         
         self.reconstruction_budget = self.RECONSTRUCTION_BUDGET_USD # Fixed budget 50$
-        self.reconstruction_spent = 0.0
-        
-        self.total_cost_up = 0.0 # For VWAP
-        self.total_cost_down = 0.0 # For VWAP
         
         self.entry_sum_target = 0.0 
         self.is_reconstructing_order = False 
@@ -89,41 +104,84 @@ class StraddleReconstructStrategy:
         self.last_reconstruct_cost = 0.0
         self.latest_reconstruct_debug = {}
         
+        
+        # 🔴 New Brake & Selectivity Mechanisms
+        self.ewma_sum_px = None
+        self.ewma_sample_count = 0
+        self.EWMA_ALPHA = 0.033 # ~60s window at 1 tick/sec
+        self.EWMA_WARMUP_SAMPLES = 60
+        
+        self.last_straddle_completion_ts = 0.0
+        self.EXPANSION_COOLDOWN_SEC = 30.0
+        
+        self.NEVER_REINFORCE_SUM_PX = 1.01
+        self.MAX_SKEW_RATIO = 2.0 # Max 2x size on one leg
+        
         # Logging / Debug
         self.last_reprice_ts = 0.0
         self.actual_size = 0.0 # Last entry size
         
         print(f"[RECONSTRUCT] Init {self.slug}. Budget=${self.reconstruction_budget} Cap={self.MAX_TOTAL_SHARES}. Tolerance={self.rebalance_tolerance_shares}")
+
+    def get_current_state(self) -> Dict:
+        """Returns the current state for persistence."""
+        return {
+            "has_traded": self.has_traded,
+            "filled_up_shares": self.filled_up_shares,
+            "filled_down_shares": self.filled_down_shares,
+            "total_cost_up": self.total_cost_up,
+            "total_cost_down": self.total_cost_down,
+            "reconstruction_spent": self.reconstruction_spent,
+            "up_order_id": self.up_order_id,
+            "down_order_id": self.down_order_id,
+            "_last_sz_up": self._last_sz_up,
+            "_last_sz_down": self._last_sz_down
+        }
     def sync_state(self, up_shares: float, down_shares: float):
         """
         Synchronize internal inventory with external source (e.g. Wallet/API).
-        This updates filled_up_shares/filled_down_shares to reflect reality.
+        
+        [SKEPTICAL] Prevents API lag from wiping local fills by requiring consecutive zeros.
         """
         now = time.time()
-        
-        # 🔴 Stale Sync Protection
-        # If the API tries to lower our inventory shortly after a fill, we ignore it.
-        # This prevents the "wiping" issue where API lag shows 0.0 balance.
-        
         up_shares = float(up_shares)
         down_shares = float(down_shares)
         
-        is_grace_period = (now - self.last_fill_ts < self.SYNC_GRACE_PERIOD)
-        
-        # Check UP
+        # 1. Grace Period Protection
+        is_grace_period = (now - self.last_fill_ts < self.SYNC_GRACE_PERIOD) or \
+                          (self.up_order_id is not None) or (self.down_order_id is not None)
+            
         if up_shares < self.filled_up_shares and is_grace_period:
-            # print(f"[SYNC] Ignoring UP drop {self.filled_up_shares}->{up_shares} (In Grace Period)")
             up_shares = self.filled_up_shares
             
-        # Check DOWN
         if down_shares < self.filled_down_shares and is_grace_period:
-            # print(f"[SYNC] Ignoring DOWN drop {self.filled_down_shares}->{down_shares} (In Grace Period)")
             down_shares = self.filled_down_shares
 
-        # Only update if changed to avoid log noise, or just update silently
+        # 2. Conservative Zeroing (The "Skeptical" Logic)
+        # If API says 0 but local ledger says we have positions, we wait for 5 consecutive zeros.
+        if up_shares < 0.1 and down_shares < 0.1 and (self.filled_up_shares > 1.0 or self.filled_down_shares > 1.0):
+            self.consecutive_zero_syncs += 1
+            if self.consecutive_zero_syncs < 10:
+                # print(f"[SYNC] Ignoring aggressive zero-out from API (Attempt {self.consecutive_zero_syncs}/10)")
+                up_shares = self.filled_up_shares
+                down_shares = self.filled_down_shares
+            else:
+                print(f"[SYNC] API Zero-balance confirmed after {self.consecutive_zero_syncs} attempts. Resetting.")
+        else:
+            self.consecutive_zero_syncs = 0
+
+        # 3. Apply Updates
         if abs(self.filled_up_shares - up_shares) > 0.01 or abs(self.filled_down_shares - down_shares) > 0.01:
             print(f"[SYNC] Updating inventory: UP {self.filled_up_shares:.1f}->{up_shares:.1f}, DOWN {self.filled_down_shares:.1f}->{down_shares:.1f}")
             
+            # If inventory is genuinely zero, we reset budgets (only log if there was something to reset)
+            if up_shares < 0.1 and down_shares < 0.1:
+                if self.total_cost_up > 0 or self.total_cost_down > 0 or self.reconstruction_spent > 0:
+                    print("[SYNC] Inventory at zero. Resetting cost basis and budgets.")
+                self.total_cost_up = 0.0
+                self.total_cost_down = 0.0
+                self.reconstruction_spent = 0.0
+
         self.filled_up_shares = up_shares
         self.filled_down_shares = down_shares
         
@@ -148,6 +206,8 @@ class StraddleReconstructStrategy:
             "actual_size": self.actual_size,
             "filled_up_shares": self.filled_up_shares,
             "filled_down_shares": self.filled_down_shares,
+            "avg_cost_up": self.total_cost_up / self.filled_up_shares if self.filled_up_shares > 0 else 0.0,
+            "avg_cost_down": self.total_cost_down / self.filled_down_shares if self.filled_down_shares > 0 else 0.0,
             "remaining_up": 0, # Not strictly used in this mode
             "remaining_down": 0,
             
@@ -168,6 +228,12 @@ class StraddleReconstructStrategy:
             "remaining_edge": self.reconstruction_budget - self.reconstruction_spent,
             "entry_sum_target": self.entry_sum_target,
             "initial_edge_per_share": 1.0 - self.entry_sum_target if self.entry_sum_target > 0 else 0.0,
+            
+            # Rebalancing & Selectivity Fields
+            "ewma_sum_px": self.ewma_sum_px or 0.0,
+            "ewma_samples": self.ewma_sample_count,
+            "last_completion_ts": self.last_straddle_completion_ts,
+            "cooldown_remaining": max(0.0, self.EXPANSION_COOLDOWN_SEC - (time.time() - self.last_straddle_completion_ts)),
             
             # Advanced Reconstruct Debug
             "imbalance_shares": self.latest_reconstruct_debug.get("imbalance_shares", 0.0),
@@ -197,6 +263,9 @@ class StraddleReconstructStrategy:
              self.entry_sum_target = up_px + down_px 
              self.entry_up_px = up_px
              self.entry_down_px = down_px
+        
+        # Refresh grace period to prevent API balance lag from wiping internal state
+        self.last_fill_ts = time.time()
 
     # --- Pure Helpers for Reconstruction Logic ---
     
@@ -240,49 +309,76 @@ class StraddleReconstructStrategy:
             self.up_order_id = None
         if order_id == self.down_order_id:
             self.down_order_id = None
+            
+        # Refresh grace period to allow API to settle after cancellation
+        self.last_fill_ts = time.time()
         self._check_state_after_update()
 
     def on_order_update(self, order_id, filled, fill_price=0.0, filled_size=0.0):
-        if filled:
-            f_size = float(filled_size)
-            f_px = float(fill_price)
-            
-            # Identify leg and update VWAP stats
-            is_up = (order_id == self.up_order_id)
-            is_down = (order_id == self.down_order_id)
-            
-            # Update separate counts and costs
-            # Note: Assuming this is called ONCE per filled quantity (e.g. order completion)
-            if is_up and not self.up_filled:
-                self.filled_up_shares += f_size
-                self.total_cost_up += f_px * f_size
-                self.up_filled = True
-                self.up_order_id = None
-            elif is_down and not self.down_filled:
-                self.filled_down_shares += f_size
-                self.total_cost_down += f_px * f_size
-                self.down_filled = True
-                self.down_order_id = None
+        # We handle partial fills (filled=False) or full fills (filled=True)
+        f_size = float(filled_size)
+        f_px = float(fill_price)
+        
+        # Identify leg
+        is_up = (order_id == self.up_order_id)
+        is_down = (order_id == self.down_order_id)
+        
+        if not is_up and not is_down:
+            return
 
-            # Reconstruction Cost Tracking (New Logic)
-            if self.is_reconstructing_order and f_size > 0 and f_px > 0:
-                cost = 0.0
-                if is_up:
-                     # Reconstructing UP. avg_other is DOWN.
+        # Track incremental cost basis using deltas
+        if is_up:
+            new_fill = max(0.0, f_size - getattr(self, '_last_sz_up', 0.0))
+            if new_fill > 0 and f_px > 0:
+                self.total_cost_up += new_fill * f_px
+                self.filled_up_shares += new_fill # 🔴 Local Increment
+                self._last_sz_up = f_size
+                self.last_fill_ts = time.time()  # Refresh grace period
+                
+                # Reconstruction Cost Tracking
+                if self.is_reconstructing_order:
                      avg_down = self.total_cost_down / self.filled_down_shares if self.filled_down_shares > 0 else 0.5
                      overpay = (f_px + avg_down) - 1.0
-                     cost = max(0.0, overpay) * f_size
-                elif is_down:
-                     # Reconstructing DOWN. avg_other is UP.
+                     cost = max(0.0, overpay) * new_fill
+                     if cost > 0:
+                         self.reconstruction_spent += cost
+                         self.last_reconstruct_cost = cost
+            
+            if filled:
+                self.up_filled = True
+                self.up_order_id = None
+                self._last_sz_up = 0.0
+
+        elif is_down:
+            new_fill = max(0.0, f_size - getattr(self, '_last_sz_down', 0.0))
+            if new_fill > 0 and f_px > 0:
+                self.total_cost_down += new_fill * f_px
+                self.filled_down_shares += new_fill # 🔴 Local Increment
+                self._last_sz_down = f_size
+                self.last_fill_ts = time.time()  # Refresh grace period
+                
+                # Reconstruction Cost Tracking
+                if self.is_reconstructing_order:
                      avg_up = self.total_cost_up / self.filled_up_shares if self.filled_up_shares > 0 else 0.5
                      overpay = (f_px + avg_up) - 1.0
-                     cost = max(0.0, overpay) * f_size
-                
-                if cost > 0:
-                    self.reconstruction_spent += cost
-                    self.last_reconstruct_cost = cost
-            
-            # Update last fill timestamp for sync protection
+                     cost = max(0.0, overpay) * new_fill
+                     if cost > 0:
+                         self.reconstruction_spent += cost
+                         self.last_reconstruct_cost = cost
+
+            if filled:
+                self.down_filled = True
+                self.down_order_id = None
+                self._last_sz_down = 0.0
+        
+        # Cost reset if flattened
+        if self.filled_up_shares < 0.1 and self.filled_down_shares < 0.1:
+            self.total_cost_up = 0.0
+            self.total_cost_down = 0.0
+            self.reconstruction_spent = 0.0
+
+        # Update last fill timestamp for sync protection
+        if f_size > 0:
             self.last_fill_ts = time.time()
             
         self._check_state_after_update()
@@ -297,6 +393,10 @@ class StraddleReconstructStrategy:
             
             if abs(imbalance) <= self.rebalance_tolerance_shares:
                 # Balanced
+                if self.state != ReconstructState.IDLE:
+                    # Just transitioned to IDLE (completion)
+                    print(f"[RECONSTRUCT] Straddle completion detected (Inv: {self.filled_up_shares:.1f}/{self.filled_down_shares:.1f})")
+                    self.last_straddle_completion_ts = time.time()
                 self.state = ReconstructState.IDLE
             else:
                 # Unbalanced
@@ -384,170 +484,124 @@ class StraddleReconstructStrategy:
 
     def maybe_enter(self, up_bid, up_ask, down_bid, down_ask, time_remaining, available_balance=None, liquidity_depth=None, test_mode=False):
         """
-        Main decision logic.
-        Handles both Initial Entry and Rebalancing.
+        Main decision logic with Smart Selective Brakes.
         """
+        now = time.time()
         
-        # 1. Cap Check
-        total_shares = self.filled_up_shares + self.filled_down_shares
+        # 🔴 EWMA Market Analysis & Data Validation
+        sum_px = up_ask + down_ask # Using ASK for conservative sum
+        if (up_ask > 0 and down_ask > 0) and (0.80 <= sum_px <= 1.20):
+            if self.ewma_sum_px is None:
+                self.ewma_sum_px = sum_px
+                self.ewma_sample_count = 1
+            else:
+                self.ewma_sum_px = (self.EWMA_ALPHA * sum_px) + ((1.0 - self.EWMA_ALPHA) * self.ewma_sum_px)
+                self.ewma_sample_count += 1
         
-        # 🔴 Critical Point #1 — Cap Full Handling (No Overbuy Ever)
-        # If inv_up + inv_down >= MAX_CAP (allow small float error)
-        if total_shares >= (self.MAX_TOTAL_SHARES - 0.01):
-            return {'action': 'IDLE', 'reason': 'CAP_FULL'}
-            
-        # 2. Imbalance Check
+        # 0. Active Order Protection
+        if self.up_order_id or self.down_order_id:
+            return {'action': 'IDLE', 'reason': 'ORDERS_OPEN_ALREADY'}
+
         imbalance = self.filled_up_shares - self.filled_down_shares
-        # Positive = More UP = Need DOWN
-        # Negative = More DOWN = Need UP
-        
         is_one_leg = abs(imbalance) > self.rebalance_tolerance_shares
         
-        if is_one_leg:
-            # 🔴 Critical Point #2 — ONE_LEG_INVENTORY Lockdown
-            # Use strict compute_reconstruct_orders logic
-            
-            # 🔴 Critical Point #2 — ONE_LEG_INVENTORY Lockdown (New Chunked/Budget Logic)
-            imbalance = self._compute_imbalance(self.filled_up_shares, self.filled_down_shares)
-            chunk_base = min(self.RECONSTRUCT_CHUNK_SHARES, abs(imbalance))
-            
-            # Additional Cap Check for Rebalance Size
-            cap_left = self.MAX_TOTAL_SHARES - total_shares
-            chunk = min(chunk_base, cap_left)
+        total_usd_exposure = (self.filled_up_shares * up_bid) + (self.filled_down_shares * down_bid)
+        total_shares = self.filled_up_shares + self.filled_down_shares
 
-            if abs(imbalance) <= self.rebalance_tolerance_shares:
-                return {'action': 'IDLE', 'reason': "RECONSTRUCT_BALANCED"}
-                
-            b_up, b_down = 0.0, 0.0
-            avg_other = 0.0
-            px_missing_now = 0.0
+        # 1. Mode A: REBALANCING (Fixing Imbalance)
+        if is_one_leg:
+            # Time-Adaptive Caps for Rebalancing
+            if time_remaining > 600: # > 10m
+                rebalance_cap = 1.00
+                phase = "EARLY_SELECTIVE"
+                # Use BID for maker fills in early phase
+                up_px = up_bid
+                down_px = down_bid
+            else: # < 10m
+                rebalance_cap = 1.02
+                phase = "LATE_URGENT"
+                # Use ASK for aggressive taker fills in urgent phase
+                up_px = up_ask
+                down_px = down_ask
             
-            if imbalance > self.rebalance_tolerance_shares: # Have UP, Need DOWN
-                # We hold UP, so avg_other is self.total_cost_up / filled_up
-                avg_other = self.total_cost_up / self.filled_up_shares if self.filled_up_shares > 0 else 0.5
-                px_missing_now = down_bid # Target Maker Bid
-                
-                # Enforce Min Limits (Value $1 and Size 5)
-                # API Error: "Size (1.26) lower than the minimum: 5"
-                if px_missing_now > 0.001:
-                    min_val_shares = 1.05 / px_missing_now
-                    min_qty_shares = 5.0
-                    req_chunk = max(min_val_shares, min_qty_shares)
-                    
-                    if chunk < req_chunk:
-                         chunk = req_chunk
-                b_down = chunk
-            elif imbalance < -self.rebalance_tolerance_shares: # Have DOWN, Need UP
-                avg_other = self.total_cost_down / self.filled_down_shares if self.filled_down_shares > 0 else 0.5
-                px_missing_now = up_bid # Target Maker Bid
-                
-                # Enforce Min Limits (Value $1 and Size 5)
-                if px_missing_now > 0.001:
-                    min_val_shares = 1.05 / px_missing_now
-                    min_qty_shares = 5.0
-                    req_chunk = max(min_val_shares, min_qty_shares)
-                    
-                    if chunk < req_chunk:
-                         chunk = req_chunk
-                b_up = chunk
+            if sum_px > rebalance_cap:
+                return {'action': 'IDLE', 'reason': f'REBALANCE_BLOCKED_PX ({phase}: {sum_px:.2f} > {rebalance_cap})'}
             
-            overpay_limit = self._max_overpay_per_share(time_remaining)
-            # overpay = (AvgExisting + PriceMissing) - 1.0
-            # If > 0, we are paying > 1.0 total (losing money).
-            overpay_per_share = (avg_other + px_missing_now) - 1.0
-            cost_est = self._estimate_reconstruct_cost(avg_other, px_missing_now, chunk)
+            # Firebreak check
+            if sum_px > self.NEVER_REINFORCE_SUM_PX:
+                 return {'action': 'IDLE', 'reason': f'REBALANCE_BLOCKED_FIREBREAK ({sum_px:.2f} > {self.NEVER_REINFORCE_SUM_PX})'}
+
+            needed = abs(imbalance)
+            size_to_buy = max(5.0, math.ceil(needed))
             
-            budget_left = max(0.0, self.reconstruction_budget - self.reconstruction_spent)
-            
-            can_execute, block_reason = self._can_reconstruct(cost_est, overpay_per_share, budget_left, overpay_limit)
-            
-            # Save Metrics for Logging
-            self.latest_reconstruct_debug = {
-                "imbalance_shares": imbalance,
-                "avg_other_price": avg_other,
-                "px_missing_now": px_missing_now,
-                "overpay_per_share": overpay_per_share,
-                "reconstruct_chunk_shares": chunk,
-                "reconstruct_cost_est_usd": cost_est,
-                "reconstruct_overpay_limit": overpay_limit,
-                "reconstruct_block_reason": block_reason if not can_execute else "OK"
-            }
-            
-            if not can_execute:
-                return {
-                    'action': 'IDLE', 
-                    'reason': f"RECONSTRUCT_BLOCKED: {block_reason} (Op:{overpay_per_share:.4f} > L:{overpay_limit:.4f}, Cost:${cost_est:.2f})"
-                }
-            
-            return {
-                'action': 'ENTER',
-                'up_price': up_bid,
-                'down_price': down_bid,
-                'up_size': b_up,
-                'down_size': b_down,
-                'size': max(b_up, b_down), 
-                'is_reconstruct': True,
-                'reason': f"RECONSTRUCT_CHUNK: {b_up:.1f}/{b_down:.1f} (Op:{overpay_per_share:.4f} B:${budget_left:.2f})"
-            }
-            
-        # 3. Standard Balanced Entry (Symmetric)
-        trade_leg = "BOTH"
+            if imbalance < 0: # Need UP
+                return {'action': 'ENTER', 'up_price': up_px, 'down_price': 0, 'up_size': size_to_buy, 'down_size': 0, 'size': size_to_buy, 'is_reconstruct': True, 'reason': f"FIXING_IMBALANCE_{phase}: {size_to_buy:.1f} UP"}
+            else: # Need DOWN
+                return {'action': 'ENTER', 'up_price': 0, 'down_price': down_px, 'up_size': 0, 'down_size': size_to_buy, 'size': size_to_buy, 'is_reconstruct': True, 'reason': f"FIXING_IMBALANCE_{phase}: {size_to_buy:.1f} DOWN"}
+
+        # 2. Mode B: STRENGTHENING (Expansion / Scales)
         
-        # 4. Market Check (Spread)
-        sum_px = up_bid + down_bid
+        # Guard 1: Cool-down (Only for Expansion)
+        time_since_done = now - self.last_straddle_completion_ts
+        if time_since_done < self.EXPANSION_COOLDOWN_SEC:
+            return {'action': 'IDLE', 'reason': f'EXPANSION_COOLDOWN ({time_since_done:.1f}s < {self.EXPANSION_COOLDOWN_SEC}s)'}
+
+        # Guard 2: Absolute Firebreak
+        if sum_px > self.NEVER_REINFORCE_SUM_PX:
+            return {'action': 'IDLE', 'reason': f'EXPANSION_BLOCKED_FIREBREAK ({sum_px:.2f} > {self.NEVER_REINFORCE_SUM_PX})'}
+
+        # Guard 3: Relative Edge (EWMA)
+        if total_shares > 1.0: # Only if already holding something
+            if self.ewma_sample_count < self.EWMA_WARMUP_SAMPLES:
+                warmup_cap = 0.97
+                if sum_px > warmup_cap:
+                    return {'action': 'IDLE', 'reason': f'EWMA_WARMUP_ACTIVE ({self.ewma_sample_count}/{self.EWMA_WARMUP_SAMPLES}, Sum={sum_px:.2f} > {warmup_cap})'}
+            else:
+                required_edge = self.ewma_sum_px - 0.005
+                if sum_px > required_edge:
+                    return {'action': 'IDLE', 'reason': f'EWMA_EDGE_INSUFFICIENT (Sum={sum_px:.2f} > {required_edge:.3f})'}
+
+        # Guard 4: Standard Entry Cap
         if sum_px > self.MAX_SUM_PRICE:
-            return {'action': 'IDLE', 'reason': f'Spread high {sum_px:.2f} > {self.MAX_SUM_PRICE}'}
-            
-        # 5. Sizing
-        # Helper for size (Symmetric logic same as before)
-        def calc_shares(price, limit_shares):
-            if price <= 0.01: return 0.0 # Safety
-            raw = self.USD_PER_ORDER / price
-            
-            # Enforce Min Size 5 (Polymarket constraint)
-            target = max(raw, 5.0)
-            
-            final_count = math.floor(target)
-            
-            # Check against Limit (Cap)
-            if final_count > limit_shares:
-                # If we are capped below the minimum 5, we CANNOT trade new positions.
-                if limit_shares < 5.0:
-                    return 0.0
-                return math.floor(limit_shares)
-            
-            return final_count
+            return {'action': 'IDLE', 'reason': f'EXPANSION_BLOCKED_PX ({sum_px:.2f} > {self.MAX_SUM_PRICE})'}
+
+        # Exposure Guards
+        if total_usd_exposure >= (self.MAX_USD_EXPOSURE - 0.1) or total_shares >= (self.MAX_TOTAL_SHARES - 0.01):
+            return {'action': 'IDLE', 'reason': 'CAPS_FULL'}
+
+        # 3. Sizing & Scales Logic
+        def calc_shares(price, limit):
+            if price <= 0.01: return 0.0
+            return max(5.0, math.floor(min(self.USD_PER_ORDER / price, limit)))
 
         cap_left = self.MAX_TOTAL_SHARES - total_shares
         limit_per_leg = cap_left / 2.0
         
-        # Calculate raw shares independently based on $2 sizing
-        raw_up = calc_shares(up_bid, limit_per_leg)
-        raw_down = calc_shares(down_bid, limit_per_leg)
+        base_up = calc_shares(up_bid, limit_per_leg)
+        base_down = calc_shares(down_bid, limit_per_leg)
         
-        # 🔴 Critical Point #3 — Unified Symmetric Entry
-        # User Requirement: "First leg must be equilibrium".
-        # We take the MAX of the two (to ensure meaningful exposure on cheaper leg)
-        # But we must clamp it to the limit_per_leg again to be safe.
+        up_size = max(base_up, base_down)
+        down_size = up_size
         
-        unified_size = max(raw_up, raw_down)
+        reason = "EXPANSION_STRADDLE"
         
-        if unified_size > limit_per_leg:
-             unified_size = math.floor(limit_per_leg)
-             
-        up_size = unified_size
-        down_size = unified_size
-        
-        if up_size < 1.0 or down_size < 1.0:
-            return {'action': 'IDLE', 'reason': 'TEST_SIZE_TOO_SMALL (BOTH)'}
+        # 🔴 Scales Logic (Inventory Skew)
+        # Apply only if within tolerance but non-zero
+        if 0 < abs(imbalance) <= self.rebalance_tolerance_shares:
+            if imbalance < 0: # Have more DOWN, buy more UP
+                up_size = min(up_size * self.MAX_SKEW_RATIO, limit_per_leg * 2.0)
+                reason = "SCALES_SKEW_UP"
+            else: # Have more UP, buy more DOWN
+                down_size = min(down_size * self.MAX_SKEW_RATIO, limit_per_leg * 2.0)
+                reason = "SCALES_SKEW_DOWN"
 
-        # 6. Execute (Standard)
+        # Execute
         return {
             'action': 'ENTER',
             'up_price': up_bid,
             'down_price': down_bid,
             'up_size': up_size,
             'down_size': down_size,
-            'size': max(up_size, down_size), 
-            'reason': f"Leg:{trade_leg} UP:{up_size} DOWN:{down_size}"
+            'size': max(up_size, down_size),
+            'reason': reason
         }

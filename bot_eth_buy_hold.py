@@ -18,21 +18,47 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
 from gabagool_lite.straddle_strategy import StraddleArbStrategy
-from gabagool_lite.straddle_strategy_reconstruct import StraddleReconstructStrategy
 from gabagool_lite.polymarket_client import PolymarketClientWrapper
 from gabagool_lite.size_optimizer import SizeOptimizer, SizingConfig
 from gabagool_lite.utils_time import compute_time_remaining
+from gabagool_lite.straddle_strategy_reconstruct import StraddleReconstructStrategy
+from gabagool_lite.straddle_strategy_buy_hold import StraddleBuyHoldStrategy
 
-# ... (lines 25-312)
-
+class SafeClientWrapper(PolymarketClientWrapper):
+    """
+    Fail-Safe Wrapper that strictly blocks any SELL orders.
+    Returns None and logs error instead of executing.
+    """
+    def place_limit_maker(self, token_id, price, size, side="BUY"):
+        # Explicitly check side or inferred intent
+        # PolymarketClientWrapper actually infers side from price vs book? 
+        # No, base method doesn't take 'side' arg typically, it assumes BUY for entry strategies?
+        # Let's override the base method signature if it exists, or check usage.
+        # In this bot, we only call place_limit_maker for entering, which is BUY.
+        # But to be safe, we check if price > best_ask? No, that's Maker check.
+        
+        # Guard: If anyone tries to pass side="SELL" (if supported)
+        if str(side).upper() == "SELL":
+            print("[SAFE-WRAPPER] FATAL: SELL DETECTED IN BUY-HOLD BOT. BLOCKED.")
+            return None
+            
+        return super().place_limit_maker(token_id, price, size)
+        
+    def unwind_position(self, token_id, quantity, max_slippage=0.0):
+        print("[SAFE-WRAPPER] FATAL: UNWIND (SELL) ATTEMPTED. BLOCKED.")
+        return None
+        
+    def cancel_all(self):
+        # Cancel is allowed
+        return super().cancel_all()
 
 # CONSTANTS
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 TARGET_CRYPTOS = ["eth"]
-LOG_FILE_PREFIX = "straddle_strategy_log_eth"
-STATE_FILE = "gabagool_lite_state_eth.json"
+LOG_FILE_PREFIX = "buy_hold_log"
+STATE_FILE = "gabagool_lite_state.json"
 
 # SIZING CONFIGURATION
 BANKROLL_USD = 10000.0  # Total bankroll for risk calculations
@@ -45,6 +71,12 @@ SIZING_CONFIG = SizingConfig(
     test_size_shares=15, # Average size for test mode
     MAX_USD_PER_MARKET=15.0 # Max USD exposure per market (Total $15)
 )
+
+# EXECUTION CONFIG
+# Allow setting via env var OR command line arg "reconstruct"
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "buy_hold").lower()
+if "reconstruct" in sys.argv:
+    EXECUTION_MODE = "reconstruct"
 
 # ---------------- UTILS: PERSISTENCE ---------------- #
 
@@ -61,7 +93,7 @@ def save_state(state):
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
-        print(f"[ETH-BOT] [!] State Save Error: {e}")
+        print(f"[!] State Save Error: {e}")
 
 # ---------------- UTILS: ORDERBOOK FETCHER ---------------- #
 
@@ -75,12 +107,12 @@ class OrderbookFetcher:
 
 def discover_market(is_test_mode=False):
     """
-    Discover active BTC 15m markets.
+    Discover active ETH 15m markets.
     Try direct API approach first, fallback to constructed slugs.
     """
-    print("[ETH-BOT] [DISCOVER] Searching for ETH 15m markets...")
+    print("[DISCOVER] Searching for ETH 15m markets...")
 
-    # Method 1: Try markets API with ETH filter
+    # Method 1: Try markets API with BTC filter
     try:
         url = f"{GAMMA_API_BASE}/markets"
         params = {
@@ -102,7 +134,7 @@ def discover_market(is_test_mode=False):
             if "eth" not in slug.lower() or "15m" not in slug.lower():
                 continue
 
-            print(f"[ETH-BOT] [DISCOVER] Found ETH 15m market: {slug}")
+            print(f"[DISCOVER] Found ETH 15m market: {slug}")
 
             # Parse timestamps
             start_str = m.get("startDate") or m.get("start_date")
@@ -141,7 +173,7 @@ def discover_market(is_test_mode=False):
                     down_id = token_ids[i]
 
             if up_id and down_id:
-                print(f"[ETH-BOT] [MAPPING] {slug}: UP({up_id}) DOWN({down_id})")
+                print(f"[MAPPING] {slug}: UP({up_id}) DOWN({down_id})")
                 return {
                     "slug": slug,
                     "up_token_id": up_id,
@@ -151,10 +183,10 @@ def discover_market(is_test_mode=False):
                 }
 
     except Exception as e:
-        print(f"[ETH-BOT] [!] Markets API failed: {e}")
+        print(f"[!] Markets API failed: {e}")
 
     # Method 2: Fallback to constructed slugs if API fails
-    print("[ETH-BOT] [DISCOVER] Trying constructed slugs...")
+    print("[DISCOVER] Trying constructed slugs...")
     now_ts = int(time.time())
 
     # Try the user's example and nearby timestamps
@@ -178,7 +210,6 @@ def discover_market(is_test_mode=False):
             continue
 
         slug = f"eth-updown-15m-{ts}"
-            
         try:
             url = f"{GAMMA_API_BASE}/markets?slug={slug}"
             response = requests.get(url, timeout=5)
@@ -193,7 +224,7 @@ def discover_market(is_test_mode=False):
                     market_data = data
                 
                 if market_data.get("active", True):
-                    print(f"[ETH-BOT] [DISCOVER] Found via slug: {slug}")
+                    print(f"[DISCOVER] Found via slug: {slug}")
                     # Parse and return as above
                     start_str = market_data.get("startDate")
                     end_str = market_data.get("endDate")
@@ -212,7 +243,7 @@ def discover_market(is_test_mode=False):
                                 down_id = token_ids[i]
 
                         if up_id and down_id:
-                            print(f"[ETH-BOT] [MAPPING] {slug}: UP({up_id}) DOWN({down_id})")
+                            print(f"[MAPPING] {slug}: UP({up_id}) DOWN({down_id})")
                             return {
                                 "slug": slug,
                                 "up_token_id": up_id,
@@ -225,7 +256,7 @@ def discover_market(is_test_mode=False):
 
     # If in test mode and no real markets found, construct slug from current time
     if is_test_mode:
-        print("[ETH-BOT] [DISCOVER] No real markets found - constructing test slug from current time")
+        print("[DISCOVER] No real markets found - constructing test slug from current time")
         now = int(time.time())
 
         # Find the start of the current 15-minute interval
@@ -236,9 +267,9 @@ def discover_market(is_test_mode=False):
         # Construct the expected slug format
         test_slug = f"eth-updown-15m-{current_interval_start}"
 
-        print(f"[ETH-BOT] [DEBUG] Current time: {now}")
-        print(f"[ETH-BOT] [DEBUG] Current interval: {current_interval_start} to {current_interval_end}")
-        print(f"[ETH-BOT] [DEBUG] Test slug: {test_slug}")
+        print(f"[DEBUG] Current time: {now}")
+        print(f"[DEBUG] Current interval: {current_interval_start} to {current_interval_end}")
+        print(f"[DEBUG] Test slug: {test_slug}")
 
         # For testing, we'll use fake tokens since the real market might not exist
         return {
@@ -249,14 +280,14 @@ def discover_market(is_test_mode=False):
             "end_ts": current_interval_end
         }
 
-    print("[ETH-BOT] [DISCOVER] No active ETH 15m markets found")
+    print("[DISCOVER] No active ETH 15m markets found")
     return None
 
 # ---------------- UTILS: SUMMARY LOGGING ---------------- #
 
 def log_market_summary(strategy, market_info):
-    """Logs a one-line summary of the market result to market_summaries_eth.csv."""
-    summary_file = "market_summaries_eth.csv"
+    """Logs a one-line summary of the market result to market_summaries.csv."""
+    summary_file = "market_summaries.csv"
     if not strategy: 
         return
         
@@ -267,55 +298,37 @@ def log_market_summary(strategy, market_info):
     pnl = 0.0
     outcome = "NO_TRADE"
     details = "No execution"
-    
-    # Use total inventory as the definitive size for summary
-    size_up = getattr(strategy, 'filled_up_shares', 0.0)
-    size_down = getattr(strategy, 'filled_down_shares', 0.0)
-    total_size = size_up + size_down
+    size = getattr(strategy, 'actual_size', 0)
 
-    # Calculate PnL based on fills (Standardizing for Reconstruct and Arb)
-    avg_up = 0.0
-    if size_up > 0:
-        avg_up = getattr(strategy, 'total_cost_up', 0.0) / size_up
-    else:
-        avg_up = getattr(strategy, 'entry_up_px', 0.0)
-        
-    avg_down = 0.0
-    if size_down > 0:
-        avg_down = getattr(strategy, 'total_cost_down', 0.0) / size_down
-    else:
-        avg_down = getattr(strategy, 'entry_down_px', 0.0)
-
-    is_up_filled = getattr(strategy, 'up_filled', False)
-    is_down_filled = getattr(strategy, 'down_filled', False)
-
-    if is_up_filled and is_down_filled:
+    # Calculate PnL based on fills
+    if strategy.up_filled and strategy.down_filled:
         outcome = "FULL_STRADDLE"
-        cost = avg_up + avg_down
-        pnl = (1.0 - cost) * (max(size_up, size_down))
-        details = f"Bought UP@{avg_up:.2f} DOWN@{avg_down:.2f}"
-    elif is_up_filled or is_down_filled:
+        cost = strategy.entry_up_px + strategy.entry_down_px
+        # Revenue is 1.0 per share (settlement)
+        pnl = (1.0 - cost) * size
+        details = f"Bought UP@{strategy.entry_up_px:.2f} DOWN@{strategy.entry_down_px:.2f}"
+    elif strategy.up_filled or strategy.down_filled:
         outcome = "UNWOUND"
-        leg = "UP" if is_up_filled else "DOWN"
-        entry = avg_up if is_up_filled else avg_down
-        exit_px = getattr(strategy, '_last_unwind_price', 0.0)
-        pnl = (exit_px - entry) * (size_up if is_up_filled else size_down)
+        leg = "UP" if strategy.up_filled else "DOWN"
+        entry = strategy.entry_up_px if strategy.up_filled else strategy.entry_down_px
+        exit_px = strategy._last_unwind_price
+        pnl = (exit_px - entry) * size
         details = f"Unwound {leg} @ {exit_px:.2f} (Entry {entry:.2f})"
-    elif total_size > 0:
-        outcome = "PARTIAL"
-        pnl = (avg_up * size_up) + (avg_down * size_down) # Current cost basis (negative PnL if not exited)
-        details = f"Ended with partial inv: {size_up:.1f} UP / {size_down:.1f} DOWN"
     else:
+        # IDLE or failed
         outcome = "SKIPPED" if strategy.state.value == "IDLE" else strategy.state.value
-        details = "No execution or market expired"
+        if outcome == "SKIPPED":
+            details = "Market expired or preconditions not met"
+        else:
+            details = f"Ended in state {strategy.state.value}"
 
     try:
         row = {
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "slug": market_info.get("slug", "unknown"),
-            "pnl": round(float(pnl), 4),
+            "pnl": round(pnl, 4),
             "outcome": outcome,
-            "size": round(float(total_size), 2),
+            "size": size,
             "details": details
         }
         
@@ -327,9 +340,9 @@ def log_market_summary(strategy, market_info):
                 writer.writeheader()
             writer.writerow(row)
             
-        print(f"[ETH-BOT] [SUMMARY] PnL: ${pnl:.2f} | {outcome} | {details}")
+        print(f"[SUMMARY] PnL: ${pnl:.2f} | {outcome} | {details}")
     except Exception as e:
-        print(f"[ETH-BOT] [!] Summary Log Error: {e}")
+        print(f"[!] Summary Log Error: {e}")
 
 # ---------------- MAIN ---------------- #
 
@@ -337,28 +350,17 @@ def run():
     # Check mode
     DRY_RUN = False
     VERIFY_MODE = False
-    EXECUTION_MODE = "standard" # standard vs reconstruct
 
     if len(sys.argv) > 1:
         if sys.argv[1] == "test":
             DRY_RUN = True
-            print("[ETH-BOT] [MODE] TEST MODE (No real trades)")
+            print("[MODE] TEST MODE (No real trades)")
         elif sys.argv[1] == "verify":
             VERIFY_MODE = True
             DRY_RUN = True  # Verify mode always uses dry run
-            print("[ETH-BOT] [MODE] VERIFY MODE (Testing invariants)")
-        elif sys.argv[1] == "reconstruct":
-            EXECUTION_MODE = "reconstruct"
-            print("[ETH-BOT] [MODE] RECONSTRUCT MODE (Inventory Balancing)")
-            if len(sys.argv) > 2 and sys.argv[2] == "test":
-                 DRY_RUN = True
-                 print("[ETH-BOT] [MODE] (TEST SIZING)")
-        elif len(sys.argv) > 2 and sys.argv[2] == "reconstruct":
-             # Handle "live reconstruct" case if user types that
-             EXECUTION_MODE = "reconstruct"
-             print("[ETH-BOT] [MODE] RECONSTRUCT MODE")
+            print("[MODE] VERIFY MODE (Testing invariants)")
         else:
-            print("[ETH-BOT] [MODE] LIVE MODE (Real trades enabled)")
+            print("[MODE] LIVE MODE (Real trades enabled)")
 
     if VERIFY_MODE:
         return run_verify_mode()
@@ -368,7 +370,7 @@ def run():
     funder = os.getenv("POLYMARKET_PROXY_ADDRESS")
 
     if not pk and not DRY_RUN:
-        print("[ETH-BOT] Missing POLYGON_PRIVATE_KEY")
+        print("Missing POLYGON_PRIVATE_KEY")
         return
 
     # Client Setup
@@ -382,14 +384,14 @@ def run():
                 api_passphrase=os.getenv("POLYMARKET_CLOB_API_PASSPHRASE")
             )
             client = ClobClient(host=HOST, key=pk, chain_id=CHAIN_ID, signature_type=2, funder=funder, creds=creds)
-            pm_wrapper = PolymarketClientWrapper(client)
-            print("[ETH-BOT] [AUTH] ClobClient Connected")
+            pm_wrapper = SafeClientWrapper(client)
+            print("[AUTH] ClobClient Connected (SAFE WRAPPER ENABLED)")
         except Exception as e:
-            print(f"[ETH-BOT] [!] Auth Error: {e}")
+            print(f"[!] Auth Error: {e}")
             return
     else:
         # For test mode, create wrapper without client
-        pm_wrapper = PolymarketClientWrapper()
+        pm_wrapper = SafeClientWrapper()
 
     # State Load
     persisted_state = load_state()
@@ -397,7 +399,7 @@ def run():
     # Initialize Size Optimizer and calibrate from logs
     size_optimizer = SizeOptimizer(SIZING_CONFIG)
     size_optimizer.calibrate_from_logs()
-    print(f"[ETH-BOT] [SIZING] Initialized with config: {size_optimizer.get_config_summary()}")
+    print(f"[SIZING] Initialized with config: {size_optimizer.get_config_summary()}")
 
     # Loop Vars
     current_market = None
@@ -405,6 +407,9 @@ def run():
     log_file = None
     last_csv_log_time = 0
     
+    # Logging Throttling
+    last_idle_log_ts = 0
+    last_idle_reason = ""
 
     while True:
         # Define mode flags for this iteration
@@ -417,31 +422,47 @@ def run():
             if m:
                 current_market = m
                 slug = m["slug"]
-                print(f"[ETH-BOT] [MARKET] Found: {slug}")
+                print(f"[MARKET] Found: {slug}")
 
                 # Check persistence
-                has_traded = persisted_state.get(slug, False)
+                state_data = persisted_state.get(slug, {})
+                has_traded = False
+                initial_state = None
+                
+                if isinstance(state_data, bool):
+                     has_traded = state_data
+                elif isinstance(state_data, dict):
+                     has_traded = state_data.get("has_traded", False)
+                     initial_state = state_data
+                
                 if has_traded:
-                    print(f"[ETH-BOT] [STATE] Market {slug} already traded.")
+                    print(f"[STATE] Market {slug} has history.")
 
-                # Initialize strategy with sizing optimizer
-                if EXECUTION_MODE == "reconstruct":
-                     print(f"[ETH-BOT] [INIT] Using RECONSTRUCT strategy for {slug}")
-                     strategy = StraddleReconstructStrategy(
+                # Initialize Strategy based on Mode
+                if EXECUTION_MODE == "buy_hold":
+                    print(f"[INIT] Using BUY/HOLD strategy for {slug}")
+                    strategy = StraddleBuyHoldStrategy(
                         slug=slug,
-                        has_traded=True if has_traded else False,
+                        has_traded=has_traded,
                         size_optimizer=size_optimizer,
                         bankroll_usd=BANKROLL_USD,
-                        initial_state=has_traded if isinstance(has_traded, dict) else None,
-                        max_usd_exposure=SIZING_CONFIG.MAX_USD_PER_MARKET
-                     )
-                else:
-                     strategy = StraddleArbStrategy(
+                        initial_state=initial_state
+                    )
+                elif EXECUTION_MODE == "reconstruct":
+                    print(f"[INIT] Using RECONSTRUCT strategy for {slug}")
+                    strategy = StraddleReconstructStrategy(
                         slug=slug,
                         has_traded=has_traded,
                         size_optimizer=size_optimizer,
                         bankroll_usd=BANKROLL_USD
-                     )
+                    )
+                else:
+                    strategy = StraddleArbStrategy(
+                        slug=slug,
+                        has_traded=has_traded,
+                        size_optimizer=size_optimizer,
+                        bankroll_usd=BANKROLL_USD
+                    )
 
                 # Setup log file with header if not exists
                 log_file = f"{LOG_FILE_PREFIX}_{slug}.csv"
@@ -462,20 +483,18 @@ def run():
                             "min_leg_price", "max_leg_price", "min_profit_per_share", "profit_both", "price_bounds_ok", "profit_ok", "skip_reason", "blocked_price_bounds", "blocked_low_profit",
                             "taker_path_attempted", "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                             "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
-                            "avg_cost_up", "avg_cost_down",
                             "filled_first_price", "remaining_up", "remaining_down", "entry_id",
                             "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
-                            "inv_up", "inv_down", "total_inventory", "cap_remaining",
                             "reconstruction_budget", "reconstruction_spent", "remaining_edge",
                             "entry_sum_target", "initial_edge_per_share",
                             "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
                             "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason",
-                            "ewma_sum_px", "ewma_samples", "last_completion_ts", "cooldown_remaining"
+                            "avg_cost_up", "avg_cost_down"
                         ])
                         writer.writeheader()
 
             else:
-                print("[ETH-BOT] [DISCOVER] No market... sleep 2s")
+                print("[DISCOVER] No market... sleep 2s")
                 time.sleep(2)
                 continue
 
@@ -483,7 +502,7 @@ def run():
         now = time.time()
         time_remaining = compute_time_remaining(current_market["slug"], now)
         if time_remaining <= 0:
-            print("[ETH-BOT] [MARKET] Expired. Switching to next market immediately.")
+            print("[MARKET] Expired. Switching to next market immediately.")
             if current_market and strategy and not getattr(strategy, "has_printed_done", False):
                  log_market_summary(strategy, current_market)
             current_market = None
@@ -491,30 +510,30 @@ def run():
             # Continue without sleep to find next market immediately
             continue
         elif time_remaining <= 60:  # Less than 1 minute remaining
-            print(f"[ETH-BOT] [MARKET] Market ending soon: {time_remaining:.0f}s remaining")
+            print(f"[MARKET] Market ending soon: {time_remaining:.0f}s remaining")
 
         # Get fresh orderbooks
         try:
             up_bid, up_ask = pm_wrapper.get_orderbook(current_market["up_token_id"])
             down_bid, down_ask = pm_wrapper.get_orderbook(current_market["down_token_id"])
         except Exception as e:
-            print(f"[ETH-BOT] [!] Orderbook error: {e}")
+            print(f"[!] Orderbook error: {e}")
             time.sleep(1)
             continue
             
-        if not DRY_RUN:
-            # [HYBRID-SYNC] Use API balance as a safety floor.
-            # Managed locally but synced after SYNC_GRACE_PERIOD
+        # [SYNC] Synchronize State (Continuous)
+        # Only in reconstruct mode or if strategy supports it
+        if hasattr(strategy, "sync_state"):
             try:
-                now = time.time()
-                if (now - strategy.last_fill_ts) > strategy.SYNC_GRACE_PERIOD:
-                    up_bal = pm_wrapper.get_token_balance(current_market["up_token_id"])
-                    down_bal = pm_wrapper.get_token_balance(current_market["down_token_id"])
-                    if up_bal is not None and down_bal is not None:
-                        old_up, old_down = strategy.filled_up_shares, strategy.filled_down_shares
-                        strategy.sync_state(up_bal, down_bal)
-                        if abs(old_up - up_bal) > 0.01 or abs(old_down - down_bal) > 0.01:
-                            print(f"[ETH-BOT] [SYNC] Inventory updated: {old_up}/{old_down} -> {up_bal}/{down_bal}")
+                # Optimized: We might want to throttle this if it's too slow
+                # For now, "tout le temps" = every loop
+                up_bal = pm_wrapper.get_token_balance(current_market["up_token_id"])
+                down_bal = pm_wrapper.get_token_balance(current_market["down_token_id"])
+                
+                # HYBRID MODEL: Only sync if API returns valid data (not None)
+                # If API fails (None), we TRUST INTERNAL MEMORY and skip sync.
+                if up_bal is not None and down_bal is not None:
+                    strategy.sync_state(up_bal, down_bal)
             except Exception as e:
                 # Don't crash main loop on sync error
                 pass
@@ -544,21 +563,21 @@ def run():
                 sizing_debug = enter_result.get("sizing_debug", {})
 
                 if not DRY_RUN:
-                    print(f"[ETH-BOT] [EXEC] Placing straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f} Size={optimal_size}")
+                    print(f"[EXEC] Placing straddle: UP@{enter_result['up_price']:.2f} DOWN@{enter_result['down_price']:.2f} Size={optimal_size}")
 
                     up_oid = None
                     down_oid = None
 
-                    # Handle Asymmetric Sizing (Reconstruct Mode logic)
+                    # Handle Asymmetric Sizing (Reconstruct Mode)
                     up_size = enter_result.get('up_size', optimal_size)
                     down_size = enter_result.get('down_size', optimal_size)
                     
                     if up_size > 0:
                         up_oid = pm_wrapper.place_limit_maker(current_market["up_token_id"],
-                                                            enter_result["up_price"], up_size)
+                                                              enter_result["up_price"], up_size)
                     if down_size > 0:
                         down_oid = pm_wrapper.place_limit_maker(current_market["down_token_id"],
-                                                                enter_result["down_price"], down_size)
+                                                                 enter_result["down_price"], down_size)
 
                     if up_oid or down_oid:
                         strategy.on_orders_placed(
@@ -567,41 +586,45 @@ def run():
                             down_px=enter_result.get('down_price', 0.0),
                             is_reconstruct=enter_result.get('is_reconstruct', False)
                         )
-                        print(f"[ETH-BOT] [OK] Orders placed: UP={up_oid} ({up_size}), DOWN={down_oid} ({down_size})")
+                        print(f"[OK] Orders placed: UP={up_oid} ({up_size}), DOWN={down_oid} ({down_size})")
                     else:
-                        print("[ETH-BOT] [X] Order placement failed")
+                        print("[X] Order placement failed (No ID returned)")
                 else:
-                    up_size = enter_result.get('up_size', optimal_size)
-                    down_size = enter_result.get('down_size', optimal_size)
-                    print(f"[ETH-BOT] [EXEC] (DRY) Would place: UP@{enter_result['up_price']:.2f} (x{up_size}) DOWN@{enter_result['down_price']:.2f} (x{down_size})")
-                    strategy.on_orders_placed(
+                     # DRY RUN BLOCK
+                     up_size = enter_result.get('up_size', optimal_size)
+                     down_size = enter_result.get('down_size', optimal_size)
+                     print(f"[EXEC] (DRY) Would place: UP@{enter_result['up_price']:.2f} (x{up_size}) DOWN@{enter_result['down_price']:.2f} (x{down_size})")
+                     strategy.on_orders_placed(
                         "DRY_UP", "DRY_DOWN", max(up_size, down_size),
                         up_px=enter_result.get('up_price', 0.0),
                         down_px=enter_result.get('down_price', 0.0),
                         is_reconstruct=enter_result.get('is_reconstruct', False)
-                    )
+                     )
 
             elif enter_result["action"] == "IDLE":
                 reason = enter_result.get('reason', '')
-                sum_px = up_ask + down_ask
-                ewma = getattr(strategy, 'ewma_sum_px', 0.0) or 0.0
-                ewma_s = f"{ewma:.4f}" if ewma > 0 else "WARMUP"
+                sum_px = up_bid + down_bid
                 
-                # STATUS LOGGING
-                if "ORDER" not in reason: 
+                # Throttled Logging for IDLE states (Every 10s or if reason changes)
+                should_log_idle = (reason != last_idle_reason) or (time.time() - last_idle_log_ts > 10.0)
+                
+                if should_log_idle:
                      max_sum = getattr(strategy, 'MAX_SUM_PRICE', 1.0)
-                     imbalance = strategy.filled_up_shares - strategy.filled_down_shares
-                     imb_s = f"{imbalance:+.1f}"
-                     inv_s = f"{strategy.filled_up_shares:.1f}/{strategy.filled_down_shares:.1f} (Imb: {imb_s})"
-                     print(f"[ETH-BOT] [STATUS] Spread: {sum_px:.4f} (Avg: {ewma_s}) | Inv: {inv_s} | Reason: {reason}")
-                
-                # Enrich log data
+                     inv_s = f"{strategy.filled_up_shares:.1f}/{strategy.filled_down_shares:.1f}"
+                     print(f"[IDLE] Reason: {reason} | Spread: {sum_px:.3f} | Inv: {inv_s} | TimeRem: {time_remaining:.0f}s")
+                     
+                     last_idle_log_ts = time.time()
+                     last_idle_reason = reason
+
+
+                # Force log ORDERS_OPEN state immediately after placement
                 log_data = strategy.get_log_data(
                     up_bid, up_ask, down_bid, down_ask, now,
                     enter_result=enter_result,
-                    sizing_debug=sizing_debug if 'sizing_debug' in locals() else {}
+                    sizing_debug=sizing_debug
                 )
-
+                
+                # Enrich log data
                 from gabagool_lite.utils_time import parse_market_start_ts
                 market_start_ts = parse_market_start_ts(current_market["slug"])
                 market_end_ts = market_start_ts + 900.0 if market_start_ts else 0.0
@@ -637,14 +660,15 @@ def run():
                         "skip_reason", "blocked_price_bounds", "blocked_low_profit", "taker_path_attempted",
                         "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                         "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
-                        "avg_cost_up", "avg_cost_down",
                         "filled_first_price", "remaining_up", "remaining_down", "entry_id",
                         "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                        # New Reconstruct Fields
                         "inv_up", "inv_down", "total_inventory", "cap_remaining",
                         "reconstruction_budget", "reconstruction_spent", "remaining_edge",
                         "entry_sum_target", "initial_edge_per_share",
                         "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
-                        "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
+                        "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason",
+                        "avg_cost_up", "avg_cost_down"
                     ])
                     if not file_exists:
                         writer.writeheader()
@@ -659,129 +683,108 @@ def run():
         should_cancel, order_id, reason = strategy.should_cancel_timeout(time_remaining)
         if should_cancel:
             if not DRY_RUN:
-                print(f"[ETH-BOT] [TIMEOUT] Cancelling {order_id}: {reason}")
+                print(f"[TIMEOUT] Cancelling {order_id}: {reason}")
                 pm_wrapper.cancel_order(order_id)
                 strategy.on_order_canceled(order_id)
             else:
-                print(f"[ETH-BOT] [TIMEOUT] (DRY) Would cancel {order_id}: {reason}")
+                print(f"[TIMEOUT] (DRY) Would cancel {order_id}: {reason}")
                 strategy.on_order_canceled(order_id)
 
         # Check for one-leg management action
         action_res = strategy.get_management_action(now, up_bid, up_ask, down_bid, down_ask, time_remaining)
         action_type = action_res.get("action")
         
-        should_unwind = False
-        leg = None
-        reason = ""
-
         if action_type == "TIMEOUT_CUT":
             # Transition to FLATTENING
             strategy.state = strategy.state.FLATTENING
-            print(f"[ETH-BOT] [UNWIND] Time Limit reached: {action_res.get('reason')}. Transitioning to FLATTENING.")
+            print(f"[UNWIND] Time Limit reached: {action_res.get('reason')}. Transitioning to FLATTENING.")
             # Explicitly cancel open orders first
             if strategy.up_order_id and not strategy.up_filled:
                 pm_wrapper.cancel_order(strategy.up_order_id)
                 strategy.on_order_canceled(strategy.up_order_id)
-                print(f"[ETH-BOT] [UNWIND] Canceled UP order {strategy.up_order_id}")
+                print(f"[UNWIND] Canceled UP order {strategy.up_order_id}")
             if strategy.down_order_id and not strategy.down_filled:
                 pm_wrapper.cancel_order(strategy.down_order_id)
                 strategy.on_order_canceled(strategy.down_order_id)
-                print(f"[ETH-BOT] [UNWIND] Canceled DOWN order {strategy.down_order_id}")
+                print(f"[UNWIND] Canceled DOWN order {strategy.down_order_id}")
 
-        # FLATTENING STATE HANDLER
+        elif action_type == "TAKER_COMPLETE":
+             # Execute Taker Buy to complete the straddle
+             leg = action_res.get("leg")
+             qty = action_res.get("qty")
+             price = action_res.get("price")
+             print(f"[ETH-BOT] [TAKER-COMPLETE] Attempting to buy {qty} of {leg} @ {price:.3f} to complete straddle.")
+             
+             # Cancel the maker order for this leg first if it exists
+             order_id_to_cancel = strategy.up_order_id if leg == "UP" else strategy.down_order_id
+             if order_id_to_cancel:
+                 pm_wrapper.cancel_order(order_id_to_cancel)
+                 strategy.on_order_canceled(order_id_to_cancel)
+             
+             token_id = current_market["up_token_id"] if leg == "UP" else current_market["down_token_id"]
+             
+             if not DRY_RUN:
+                 taker_oid = pm_wrapper.place_limit_maker(token_id, price + 0.05, qty) # +0.05 buffer for fill
+                 
+                 if taker_oid:
+                     print(f"[ETH-BOT] [TAKER-COMPLETE] Order {taker_oid} placed. Waiting for fill...")
+                     time.sleep(1.0)
+                     filled, _, _ = pm_wrapper.check_order_status(taker_oid)
+                     if filled:
+                          print("[ETH-BOT] [TAKER-COMPLETE] SUCCESS. Straddle completed.")
+                          if leg == "UP": strategy.filled_up_shares += qty
+                          else: strategy.filled_down_shares += qty
+                          strategy.state = strategy.state.STRADDLE_COMPLETE
+                     else:
+                          print("[ETH-BOT] [TAKER-COMPLETE] Failed to fill immediately. Cancelling...")
+                          pm_wrapper.cancel_order(taker_oid)
+             else:
+                 print(f"[ETH-BOT] [TAKER-COMPLETE] (DRY) Would buy {qty} {leg} @ {price}")
+                 strategy.state = strategy.state.STRADDLE_COMPLETE
+
+        # FLATTENING STATE HANDLER (REMOVED FOR BUY/HOLD)
         if strategy.state.value == "FLATTENING":
-            # 1. Verify what we hold
-            # Note: strategy.filled_x_shares is 'ledger' truth, but we should verify if we want to be 100% sure
-            # For now, trust strategy ledger implies what we bought.
-            
-            leg_to_sell = None
-            if strategy.filled_up_shares > strategy.filled_down_shares:
-                leg_to_sell = "UP"
-                qty_to_sell = strategy.filled_up_shares - strategy.filled_down_shares
-                token_id = current_market["up_token_id"]
-            elif strategy.filled_down_shares > strategy.filled_up_shares:
-                leg_to_sell = "DOWN"
-                qty_to_sell = strategy.filled_down_shares - strategy.filled_up_shares
-                token_id = current_market["down_token_id"]
-            
-            if leg_to_sell and qty_to_sell > 0:
-                print(f"[ETH-BOT] [FLATTENING] Attempting to sell {qty_to_sell} of {leg_to_sell}...")
-                
-                # Unwind Function (sells at best bid - slippage)
-                unwind_order_id = pm_wrapper.unwind_position(token_id, qty_to_sell, max_slippage=0.05) # Increased slippage for panic exit
-                
-                if unwind_order_id:
-                    print(f"[ETH-BOT] [FLATTENING] Sell order placed: {unwind_order_id}. Waiting for fill...")
-                    # Update strategy: We assume it fills for now or we wait for next loop?
-                    # Problem: We need to know if it filled. 
-                    # If we use strict state machine, we should go to "UNWIND_PLACED" or check status.
-                    # Simplified: Check status next loop or just wait a bit.
-                    time.sleep(1.0) 
-                    _is_filled, avg_px, _ = pm_wrapper.check_order_status(unwind_order_id)
-                    if _is_filled:
-                        print(f"[ETH-BOT] [FLATTENING] Sell confirmed at {avg_px:.4f}.")
-                        strategy._last_unwind_price = avg_px
-                        if leg_to_sell == "UP": strategy.filled_up_shares -= qty_to_sell
-                        else: strategy.filled_down_shares -= qty_to_sell
-                        
-                        strategy.state = strategy.state.DONE
-                        strategy.has_traded = True
-                        persisted_state[current_market["slug"]] = True
-                        save_state(persisted_state)
-                    else:
-                         print(f"[ETH-BOT] [FLATTENING] Sell order {unwind_order_id} not filled immediately. Retrying next tick.")
-                         # Make sure to cancel it before retrying if it's a Limit? 
-                         # unwind_position sends a Limit. If it doesn't fill immediately, it sits there.
-                         # We should cancel it to avoid double selling if we loop.
-                         pm_wrapper.cancel_order(unwind_order_id)
-                else:
-                    print(f"[ETH-BOT] [FLATTENING] Failed to place sell order. Retrying...")
-            else:
-                 # Nothing to sell?
-                 print(f"[ETH-BOT] [FLATTENING] No net position to sell? {strategy.filled_up_shares} vs {strategy.filled_down_shares}")
-                 strategy.state = strategy.state.DONE
-                 strategy.has_traded = True
-                 persisted_state[current_market["slug"]] = True
-                 save_state(persisted_state)
+             # This should strictly never happen in Buy/Hold strategy, 
+             # but if it does, we Print and Do Nothing.
+             print(f"[CRITICAL] Strategy entered FLATTENING state which is FORBIDDEN. No action taken.")
 
         # Poll order status if we have active orders
         if strategy.up_order_id and not strategy.up_filled and not DRY_RUN:
             status, px, sz = pm_wrapper.check_order_status(strategy.up_order_id)
             if status is True:
                 strategy.on_order_update(strategy.up_order_id, True, fill_price=px, filled_size=sz)
-                print(f"[ETH-BOT] [FILL] UP order filled")
-            elif sz > 0:
-                # Capture partial fills
-                strategy.on_order_update(strategy.up_order_id, False, fill_price=px, filled_size=sz)
-                print(f"[ETH-BOT] [PARTIAL] UP order fill: {sz} @ {px}")
+                print(f"[FILL] UP order filled")
 
         if strategy.down_order_id and not strategy.down_filled and not DRY_RUN:
             status, px, sz = pm_wrapper.check_order_status(strategy.down_order_id)
             if status is True:
                 strategy.on_order_update(strategy.down_order_id, True, fill_price=px, filled_size=sz)
-                print(f"[ETH-BOT] [FILL] DOWN order filled")
-            elif sz > 0:
-                # Capture partial fills
-                strategy.on_order_update(strategy.down_order_id, False, fill_price=px, filled_size=sz)
-                print(f"[ETH-BOT] [PARTIAL] DOWN order fill: {sz} @ {px}")
+                print(f"[FILL] DOWN order filled")
 
         # For dry run, simulate fills after some time
         if DRY_RUN and strategy.state.value == "ORDERS_OPEN":
             # Simulate fills for testing
             if time.time() - strategy.up_order_time > 2:  # Simulate UP fill after 2s
                 strategy.on_order_update(strategy.up_order_id, True)
-                print(f"[ETH-BOT] [FILL] (DRY) UP order filled")
+                print(f"[FILL] (DRY) UP order filled")
             elif time.time() - strategy.down_order_time > 5:  # Simulate DOWN fill after 5s
                 strategy.on_order_update(strategy.down_order_id, True)
-                print(f"[ETH-BOT] [FILL] (DRY) DOWN order filled")
+                print(f"[FILL] (DRY) DOWN order filled")
 
-        # Persistence Update (Periodic Save)
-        persisted_state[current_market["slug"]] = strategy.get_current_state()
-        save_state(persisted_state)
-
-        # Check if strategy is DONE
-        if strategy.state.value == "DONE" and not getattr(strategy, "has_printed_done", False):
-             print(f"[ETH-BOT] [DONE] Strategy execution completed for {current_market['slug']}")
+        # Persistence Update (Every loop or throttle)
+        # We save state if inventory exists or DONE
+        if hasattr(strategy, "get_current_state"):
+             current_state = strategy.get_current_state()
+             # Only save if changed or significant? For safety, save periodically.
+             # Saving every 0.5s might be too much I/O. Let's do it on trade or every 10s.
+             state_changed = (strategy.filled_up_shares != strategy.latest_reconstruct_debug.get("last_saved_up", -1) or
+                              strategy.filled_down_shares != strategy.latest_reconstruct_debug.get("last_saved_down", -1))
+             
+             if state_changed or strategy.state.value == "DONE":
+                 persisted_state[current_market["slug"]] = current_state
+                 save_state(persisted_state)
+                 strategy.latest_reconstruct_debug["last_saved_up"] = strategy.filled_up_shares
+                 strategy.latest_reconstruct_debug["last_saved_down"] = strategy.filled_down_shares
 
         # Log data
         # Append to CSV log (Decimated: Only if (!IDLE and !DONE) or >2s elapsed)
@@ -839,15 +842,15 @@ def run():
                     "skip_reason", "blocked_price_bounds", "blocked_low_profit", "taker_path_attempted",
                     "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                     "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
-                    "avg_cost_up", "avg_cost_down",
                     "filled_first_price", "remaining_up", "remaining_down", "entry_id",
                     "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                    # New Reconstruct Fields
                     "inv_up", "inv_down", "total_inventory", "cap_remaining",
                     "reconstruction_budget", "reconstruction_spent", "remaining_edge",
                     "entry_sum_target", "initial_edge_per_share",
                     "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
                     "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason",
-                    "ewma_sum_px", "ewma_samples", "last_completion_ts", "cooldown_remaining"
+                    "avg_cost_up", "avg_cost_down"
                 ])
                 if not file_exists:
                     writer.writeheader()
@@ -860,7 +863,7 @@ def run():
         # If DONE, just print once and continue monitoring until expiry
         if strategy.state.value == "DONE" and not getattr(strategy, "has_printed_done", False):
             log_market_summary(strategy, current_market)
-            print(f"[ETH-BOT] [DONE] Finished trading {current_market['slug']}. Continuing to log until expiry...")
+            print(f"[DONE] Finished trading {current_market['slug']}. Continuing to log until expiry...")
             strategy.has_printed_done = True
 
         time.sleep(0.5)
@@ -871,7 +874,7 @@ def run():
 
 def run_verify_mode():
     """Run automated verification of all invariants."""
-    print("[ETH-BOT] [VERIFY] Starting automated invariant verification...")
+    print("[VERIFY] Starting automated invariant verification...")
 
     # Test results
     results = {
@@ -889,7 +892,7 @@ def run_verify_mode():
     pm_wrapper = PolymarketClientWrapper()
 
     # Test 1: Maker invariant
-    print("[ETH-BOT] [VERIFY] Testing maker invariant...")
+    print("[VERIFY] Testing maker invariant...")
     try:
         from gabagool_lite.straddle_strategy import StraddleArbStrategy
 
@@ -903,24 +906,24 @@ def run_verify_mode():
 
         result = strategy.maybe_enter(up_bid, up_ask, down_bid, down_ask, time_remaining)
         if result['action'] == 'ENTER' and not result.get('blocked_maker', False):
-            print("[ETH-BOT]   ✓ Maker invariant: Normal case passes")
+            print("  ✓ Maker invariant: Normal case passes")
         else:
-            print("[ETH-BOT]   ✗ Maker invariant: Normal case fails")
+            print("  ✗ Maker invariant: Normal case fails")
             results['maker_invariant'] = False
 
         # Test case 2: Verify maker guard logic exists
         # The current design prevents maker blocking by construction, so we verify the guard exists
         if 'blocked_maker' in result and isinstance(result['blocked_maker'], bool):
-            print("[ETH-BOT]   ✓ Maker invariant: Guard logic present")
+            print("  [PASS] Maker invariant: Guard logic present")
             results['maker_invariant'] = True
         else:
-            print("[ETH-BOT]   ✗ Maker invariant: Guard logic missing")
+            print("  [FAIL] Maker invariant: Guard logic missing")
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ Maker invariant test failed: {e}")
+        print(f"  [FAIL] Maker invariant test failed: {e}")
 
     # Test 2: Tick invariant
-    print("[ETH-BOT] [VERIFY] Testing tick invariant...")
+    print("[VERIFY] Testing tick invariant...")
     try:
         from gabagool_lite.utils_time import round_to_tick
 
@@ -935,16 +938,16 @@ def run_verify_mode():
                 break
 
         if all_correct:
-            print("[ETH-BOT]   ✓ Tick invariant: Rounding works correctly")
+            print("  [PASS] Tick invariant: Rounding works correctly")
             results['tick_invariant'] = True
         else:
-            print("[ETH-BOT]   ✗ Tick invariant: Rounding incorrect")
+            print("  ✗ Tick invariant: Rounding incorrect")
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ Tick invariant test failed: {e}")
+        print(f"  ✗ Tick invariant test failed: {e}")
 
     # Test 3: Time invariant
-    print("[ETH-BOT] [VERIFY] Testing time invariant...")
+    print("[VERIFY] Testing time invariant...")
     try:
         from gabagool_lite.utils_time import parse_market_start_ts, compute_time_remaining
 
@@ -952,10 +955,10 @@ def run_verify_mode():
         slug = "btc-updown-15m-1765836900"
         parsed_ts = parse_market_start_ts(slug)
         if parsed_ts == 1765836900:
-            print("[ETH-BOT]   ✓ Time invariant: Slug parsing works")
+            print("  ✓ Time invariant: Slug parsing works")
             results['time_invariant'] = True
         else:
-            print(f"[ETH-BOT]   ✗ Time invariant: Expected 1765836900, got {parsed_ts}")
+            print(f"  ✗ Time invariant: Expected 1765836900, got {parsed_ts}")
 
         # Test time remaining calculation with a known future timestamp
         now = time.time()
@@ -965,16 +968,16 @@ def run_verify_mode():
 
         # The calculation might be off due to timestamp precision, so just check it's reasonable
         if time_rem > 200 and time_rem < 400:  # Should be around 300
-            print("[ETH-BOT]   ✓ Time invariant: Time remaining calculation works")
+            print("  ✓ Time invariant: Time remaining calculation works")
         else:
-            print(f"[ETH-BOT]   ⚠️ Time invariant: Time calculation unexpected (got {time_rem})")
+            print(f"  ⚠️ Time invariant: Time calculation unexpected (got {time_rem})")
             # Don't fail the test for minor timing issues
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ Time invariant test failed: {e}")
+        print(f"  ✗ Time invariant test failed: {e}")
 
     # Test 3.5: Timeout invariant
-    print("[ETH-BOT] [VERIFY] Testing timeout invariant...")
+    print("[VERIFY] Testing timeout invariant...")
     try:
         strategy = StraddleArbStrategy("test-market", has_traded=False)
 
@@ -988,16 +991,16 @@ def run_verify_mode():
         should_cancel, order_id, reason = strategy.should_cancel_timeout(time_remaining=1000)
 
         if should_cancel and "timeout" in reason:
-            print("[ETH-BOT]   ✓ Timeout invariant: Order timeout works correctly")
+            print("  ✓ Timeout invariant: Order timeout works correctly")
             results['timeout_invariant'] = True
         else:
-            print("[ETH-BOT]   ✗ Timeout invariant: Timeout logic failed")
+            print("  ✗ Timeout invariant: Timeout logic failed")
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ Timeout invariant test failed: {e}")
+        print(f"  ✗ Timeout invariant test failed: {e}")
 
     # Test 3.6: One-leg invariant
-    print("[ETH-BOT] [VERIFY] Testing one-leg invariant...")
+    print("[VERIFY] Testing one-leg invariant...")
     try:
         strategy = StraddleArbStrategy("test-market", has_traded=False)
 
@@ -1011,16 +1014,16 @@ def run_verify_mode():
         should_unwind, leg, reason = strategy.should_unwind_one_leg(time_remaining=1000)
 
         if should_unwind and leg == "UP" and "One-leg timeout" in reason:
-            print("[ETH-BOT]   ✓ One-leg invariant: Unwind logic works correctly")
+            print("  ✓ One-leg invariant: Unwind logic works correctly")
             results['oneleg_invariant'] = True
         else:
-            print("[ETH-BOT]   ✗ One-leg invariant: Unwind logic failed")
+            print("  ✗ One-leg invariant: Unwind logic failed")
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ One-leg invariant test failed: {e}")
+        print(f"  ✗ One-leg invariant test failed: {e}")
 
     # Test 4: UP/DOWN mapping (already tested in discovery, but we can verify the logic)
-    print("[ETH-BOT] [VERIFY] Testing UP/DOWN mapping logic...")
+    print("[VERIFY] Testing UP/DOWN mapping logic...")
     try:
         # This is mainly tested during market discovery, but we can verify the outcomes parsing
         test_outcomes = ["Yes", "No"]
@@ -1035,16 +1038,16 @@ def run_verify_mode():
                 down_id = test_tokens[i]
 
         if up_id == "token1" and down_id == "token2":
-            print("[ETH-BOT]   ✓ UP/DOWN mapping: Correctly identifies outcomes")
+            print("  ✓ UP/DOWN mapping: Correctly identifies outcomes")
             results['updown_mapping'] = True
         else:
-            print("[ETH-BOT]   ✗ UP/DOWN mapping: Incorrect identification")
+            print("  ✗ UP/DOWN mapping: Incorrect identification")
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ UP/DOWN mapping test failed: {e}")
+        print(f"  ✗ UP/DOWN mapping test failed: {e}")
 
     # Test 5: Logging completeness
-    print("[ETH-BOT] [VERIFY] Testing logging completeness...")
+    print("[VERIFY] Testing logging completeness...")
     try:
         strategy = StraddleArbStrategy("test-market-1234567890", has_traded=False)
         log_data = strategy.get_log_data(0.45, 0.55, 0.45, 0.55, time.time())
@@ -1060,16 +1063,16 @@ def run_verify_mode():
 
         missing_fields = [f for f in required_fields if f not in log_data]
         if not missing_fields:
-            print("[ETH-BOT]   ✓ Logging completeness: All required fields present")
+            print("  ✓ Logging completeness: All required fields present")
             results['logging_completeness'] = True
         else:
-            print(f"[ETH-BOT]   ✗ Logging completeness: Missing fields: {missing_fields}")
+            print(f"  ✗ Logging completeness: Missing fields: {missing_fields}")
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ Logging completeness test failed: {e}")
+        print(f"  ✗ Logging completeness test failed: {e}")
 
     # Test 6: Persistence
-    print("[ETH-BOT] [VERIFY] Testing persistence...")
+    print("[VERIFY] Testing persistence...")
     try:
         # Test load/save
         test_state = {"test-market": True}
@@ -1077,31 +1080,31 @@ def run_verify_mode():
         loaded_state = load_state()
 
         if loaded_state.get("test-market") == True:
-            print("[ETH-BOT]   ✓ Persistence: Load/save works correctly")
+            print("  ✓ Persistence: Load/save works correctly")
             results['persistence'] = True
         else:
-            print("[ETH-BOT]   ✗ Persistence: Load/save failed")
+            print("  ✗ Persistence: Load/save failed")
 
     except Exception as e:
-        print(f"[ETH-BOT]   ✗ Persistence test failed: {e}")
+        print(f"  ✗ Persistence test failed: {e}")
 
     # Generate report
-    print("[ETH-BOT] \n" + "="*50)
-    print("[ETH-BOT] VERIFICATION REPORT")
-    print("[ETH-BOT] ="*50)
+    print("\n" + "="*50)
+    print("VERIFICATION REPORT")
+    print("="*50)
 
     all_pass = True
     for invariant, passed in results.items():
         status = "PASS" if passed else "FAIL"
-        print("[ETH-BOT] 25")
+        print("25")
         if not passed:
             all_pass = False
 
-    print("[ETH-BOT] ="*50)
+    print("="*50)
     if all_pass:
-        print("[ETH-BOT] 🎉 ALL INVARIANTS VERIFIED - BOT IS PRODUCTION READY")
+        print("🎉 ALL INVARIANTS VERIFIED - BOT IS PRODUCTION READY")
     else:
-        print("[ETH-BOT] ⚠️  SOME INVARIANTS FAILED - REVIEW AND FIX BEFORE PRODUCTION")
+        print("⚠️  SOME INVARIANTS FAILED - REVIEW AND FIX BEFORE PRODUCTION")
 
     # Write detailed report
     with open("verify_report.txt", "w") as f:
@@ -1121,7 +1124,7 @@ def run_verify_mode():
         f.write("- Logging completeness: Tests all CSV fields are present\n")
         f.write("- Persistence: Tests state save/load functionality\n")
 
-    print(f"[ETH-BOT] \n📄 Detailed report written to verify_report.txt")
+    print(f"\n📄 Detailed report written to verify_report.txt")
     return all_pass
 
 if __name__ == "__main__":

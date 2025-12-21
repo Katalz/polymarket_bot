@@ -3,6 +3,7 @@ Thin wrapper around Polymarket client for straddle strategy.
 """
 
 import time
+import requests
 from typing import Optional, Tuple
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs
@@ -43,34 +44,65 @@ class PolymarketClientWrapper:
 
     def get_token_balance(self, token_id: str) -> float:
         """
-        Get the specific token balance (shares held).
-        Using get_positions or similar endpoint.
+        Get the specific token balance (shares held) in the Proxy wallet.
+        Prioritizes the Data API (absolute source of truth for the frontend).
         """
         if not self.client:
-            return 1000.0 # Test mode
+            return 0.0
 
+        # Method 1: Data API Positions (Preferred Source)
+        # Method 1: Data API Positions (Preferred Source)
         try:
-            # Try specific method if available, else fallback to get_positions
-            positions = []
-            if hasattr(self.client, 'get_positions'):
-                # Pass token_id if the client supports filtering
-                # Note: api usually expects string args
-                positions = self.client.get_positions(token_id=token_id)
-            
-            # If positions is a list, look for our token
-            if isinstance(positions, list):
-                for p in positions:
-                    t_id = p.get('asset_id') or p.get('token_id')
-                    if t_id == token_id:
-                        return float(p.get('size', 0.0))
-            
-            # If the token is not found in the list, returning None instead of 0.0 
-            # tells the caller that we couldn't verify the balance (possibly stale API).
-            return None
-            
+            # Get proxy address (funder) from client or env
+            proxy = getattr(self.client, 'funder', None)
+            if not proxy:
+                import os
+                proxy = os.getenv("POLYMARKET_PROXY_ADDRESS")
+                
+            if proxy:
+                url = f"https://data-api.polymarket.com/positions?user={proxy}"
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        for p in data:
+                            asset = p.get('asset')
+                            if asset and str(asset) == str(token_id):
+                                return float(p.get('size', 0.0) or 0.0)
         except Exception as e:
-            # print(f"[!] Token balance fetch error: {e}")
-            return None
+            pass
+
+        # Method 2: Direct get_balance call (Fallback)
+        try:
+            if hasattr(self.client, 'get_balance'):
+                bal_resp = self.client.get_balance(token_id)
+                if isinstance(bal_resp, dict):
+                    return float(bal_resp.get('balance', 0.0) or 0.0)
+                return float(bal_resp or 0.0)
+        except Exception as e:
+            pass
+
+        # Method 3: Positions list (Fallback)
+        try:
+            if hasattr(self.client, 'get_positions'):
+                positions = self.client.get_positions()
+                if isinstance(positions, list):
+                    for p in positions:
+                        # Extract ID
+                        p_tid = None
+                        if isinstance(p, dict):
+                            p_tid = p.get('asset_id') or p.get('token_id')
+                        else: # Object
+                            p_tid = getattr(p, 'asset_id', None) or getattr(p, 'token_id', None)
+                            
+                        if p_tid and str(p_tid) == str(token_id):
+                            if isinstance(p, dict):
+                                return float(p.get('size', 0.0) or 0.0)
+                            return float(getattr(p, 'size', 0.0) or 0.0)
+        except Exception as e:
+            pass
+
+        return 0.0
 
     def get_orderbook(self, token_id: str) -> Tuple[float, float]:
         """
@@ -120,14 +152,15 @@ class PolymarketClientWrapper:
             print(f"[!] Orderbook error for {token_id}: {e}")
             return 0.0, 1.0
 
-    def place_limit_maker(self, token_id: str, price: float, size: float) -> Optional[str]:
+    def place_limit_maker(self, token_id: str, price: float, size: float, side: str = "BUY") -> Optional[str]:
         """
-        Place a limit maker order (BUY).
+        Place a limit maker order.
 
         Args:
             token_id: Token ID to trade
             price: Limit price
             size: Order size
+            side: "BUY" or "SELL"
 
         Returns:
             Order ID if successful, None if failed
@@ -141,7 +174,7 @@ class PolymarketClientWrapper:
                 token_id=token_id,
                 price=price,
                 size=size,
-                side="BUY"
+                side=side
             )
 
             resp = self.client.create_and_post_order(order_args)
@@ -250,8 +283,11 @@ class PolymarketClientWrapper:
             return is_filled, avg_price, filled_size
 
         except Exception as e:
+            err_msg = str(e).lower()
+            if "not found" in err_msg or "404" in err_msg:
+                 return "NOT_FOUND", 0.0, 0.0
             print(f"[!] Order status error for {order_id}: {e}")
-            return None, 0.0, 0.0
+            return "ERROR", 0.0, 0.0
 
     def unwind_position(self, token_id: str, size: float, max_slippage: float = 0.02) -> Optional[str]:
         """
@@ -302,3 +338,41 @@ class PolymarketClientWrapper:
         except Exception as e:
             print(f"[!] Unwind error for {token_id}: {e}")
             return None
+
+    def get_balance(self, token_id: str) -> Optional[float]:
+        """
+        Get the balance for a specific token ID.
+        Returns: float (balance) or None (API/Network error)
+        """
+        if not self.client:
+            return 0.0
+        
+        # Try specific balance endpoint first
+        try:
+            resp = self.client.get_balance(token_id)
+            if isinstance(resp, dict):
+                return float(resp.get('balance', 0))
+            return float(resp)
+        except Exception as e:
+            # If get_balance explicitly fails, don't assume 0 yet
+            if "not found" in str(e).lower():
+                pass # Fall through to get_positions
+            else:
+                print(f"[!] get_balance API error: {e}")
+                # Fall through to get_positions as a second chance
+        
+        # Second chance: get_positions
+        try:
+            positions = self.client.get_positions()
+            if isinstance(positions, list):
+                for pos in positions:
+                    p_token_id = getattr(pos, 'token_id', None) or pos.get('token_id')
+                    if p_token_id == token_id:
+                        return float(getattr(pos, 'size', 0) or pos.get('size', 0) or getattr(pos, 'balance', 0) or pos.get('balance', 0))
+                # If we got the list and it's NOT in there, it's genuinely 0 (Polymarket behavior)
+                return 0.0
+        except Exception as e:
+            print(f"[!] get_positions API error: {e}")
+            return None # CRITICAL: Return None on actual error
+            
+        return None # Should not be reached if first try succeeded or second try confirmed/failed

@@ -250,7 +250,7 @@ def discover_market(is_test_mode=False):
 # ---------------- UTILS: SUMMARY LOGGING ---------------- #
 
 def log_market_summary(strategy, market_info):
-    """Logs a one-line summary of the market result to market_summaries.csv."""
+    """Logs a one-line summary of the market result to market_summaries_xrp.csv."""
     summary_file = "market_summaries_xrp.csv"
     if not strategy: 
         return
@@ -262,37 +262,55 @@ def log_market_summary(strategy, market_info):
     pnl = 0.0
     outcome = "NO_TRADE"
     details = "No execution"
-    size = getattr(strategy, 'actual_size', 0)
+    
+    # Use total inventory as the definitive size for summary
+    size_up = getattr(strategy, 'filled_up_shares', 0.0)
+    size_down = getattr(strategy, 'filled_down_shares', 0.0)
+    total_size = size_up + size_down
 
-    # Calculate PnL based on fills
-    if strategy.up_filled and strategy.down_filled:
-        outcome = "FULL_STRADDLE"
-        cost = strategy.entry_up_px + strategy.entry_down_px
-        # Revenue is 1.0 per share (settlement)
-        pnl = (1.0 - cost) * size
-        details = f"Bought UP@{strategy.entry_up_px:.2f} DOWN@{strategy.entry_down_px:.2f}"
-    elif strategy.up_filled or strategy.down_filled:
-        outcome = "UNWOUND"
-        leg = "UP" if strategy.up_filled else "DOWN"
-        entry = strategy.entry_up_px if strategy.up_filled else strategy.entry_down_px
-        exit_px = strategy._last_unwind_price
-        pnl = (exit_px - entry) * size
-        details = f"Unwound {leg} @ {exit_px:.2f} (Entry {entry:.2f})"
+    # Calculate PnL based on fills (Standardizing for Reconstruct and Arb)
+    avg_up = 0.0
+    if size_up > 0:
+        avg_up = getattr(strategy, 'total_cost_up', 0.0) / size_up
     else:
-        # IDLE or failed
+        avg_up = getattr(strategy, 'entry_up_px', 0.0)
+        
+    avg_down = 0.0
+    if size_down > 0:
+        avg_down = getattr(strategy, 'total_cost_down', 0.0) / size_down
+    else:
+        avg_down = getattr(strategy, 'entry_down_px', 0.0)
+
+    is_up_filled = getattr(strategy, 'up_filled', False)
+    is_down_filled = getattr(strategy, 'down_filled', False)
+
+    if is_up_filled and is_down_filled:
+        outcome = "FULL_STRADDLE"
+        cost = avg_up + avg_down
+        pnl = (1.0 - cost) * (max(size_up, size_down))
+        details = f"Bought UP@{avg_up:.2f} DOWN@{avg_down:.2f}"
+    elif is_up_filled or is_down_filled:
+        outcome = "UNWOUND"
+        leg = "UP" if is_up_filled else "DOWN"
+        entry = avg_up if is_up_filled else avg_down
+        exit_px = getattr(strategy, '_last_unwind_price', 0.0)
+        pnl = (exit_px - entry) * (size_up if is_up_filled else size_down)
+        details = f"Unwound {leg} @ {exit_px:.2f} (Entry {entry:.2f})"
+    elif total_size > 0:
+        outcome = "PARTIAL"
+        pnl = (avg_up * size_up) + (avg_down * size_down) # Current cost basis (negative PnL if not exited)
+        details = f"Ended with partial inv: {size_up:.1f} UP / {size_down:.1f} DOWN"
+    else:
         outcome = "SKIPPED" if strategy.state.value == "IDLE" else strategy.state.value
-        if outcome == "SKIPPED":
-            details = "Market expired or preconditions not met"
-        else:
-            details = f"Ended in state {strategy.state.value}"
+        details = "No execution or market expired"
 
     try:
         row = {
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "slug": market_info.get("slug", "unknown"),
-            "pnl": round(pnl, 4),
+            "pnl": round(float(pnl), 4),
             "outcome": outcome,
-            "size": size,
+            "size": round(float(total_size), 2),
             "details": details
         }
         
@@ -304,9 +322,9 @@ def log_market_summary(strategy, market_info):
                 writer.writeheader()
             writer.writerow(row)
             
-        print(f"[SUMMARY] PnL: ${pnl:.2f} | {outcome} | {details}")
+        print(f"[XRP-BOT] [SUMMARY] PnL: ${pnl:.2f} | {outcome} | {details}")
     except Exception as e:
-        print(f"[!] Summary Log Error: {e}")
+        print(f"[XRP-BOT] [!] Summary Log Error: {e}")
 
 # ---------------- MAIN ---------------- #
 
@@ -318,13 +336,22 @@ def run():
     if len(sys.argv) > 1:
         if sys.argv[1] == "test":
             DRY_RUN = True
-            print("[MODE] TEST MODE (No real trades)")
+            print("[XRP-BOT] [MODE] TEST MODE (No real trades)")
         elif sys.argv[1] == "verify":
             VERIFY_MODE = True
             DRY_RUN = True  # Verify mode always uses dry run
-            print("[MODE] VERIFY MODE (Testing invariants)")
+            print("[XRP-BOT] [MODE] VERIFY MODE (Testing invariants)")
+        elif sys.argv[1] == "reconstruct":
+            EXECUTION_MODE = "reconstruct"
+            print("[XRP-BOT] [MODE] RECONSTRUCT MODE (Inventory Balancing)")
+            if len(sys.argv) > 2 and sys.argv[2] == "test":
+                 DRY_RUN = True
+                 print("[XRP-BOT] [MODE] (TEST SIZING)")
+        elif len(sys.argv) > 2 and sys.argv[2] == "reconstruct":
+             EXECUTION_MODE = "reconstruct"
+             print("[XRP-BOT] [MODE] RECONSTRUCT MODE")
         else:
-            print("[MODE] LIVE MODE (Real trades enabled)")
+            print("[XRP-BOT] [MODE] LIVE MODE (Real trades enabled)")
 
     if VERIFY_MODE:
         return run_verify_mode()
@@ -391,12 +418,23 @@ def run():
                     print(f"[STATE] Market {slug} already traded.")
 
                 # Initialize strategy with sizing optimizer
-                strategy = StraddleArbStrategy(
-                    slug=slug,
-                    has_traded=has_traded,
-                    size_optimizer=size_optimizer,
-                    bankroll_usd=BANKROLL_USD
-                )
+                if EXECUTION_MODE == "reconstruct":
+                     print(f"[XRP-BOT] [INIT] Using RECONSTRUCT strategy for {slug}")
+                     strategy = StraddleReconstructStrategy(
+                        slug=slug,
+                        has_traded=True if has_traded else False,
+                        size_optimizer=size_optimizer,
+                        bankroll_usd=BANKROLL_USD,
+                        initial_state=has_traded if isinstance(has_traded, dict) else None,
+                        max_usd_exposure=SIZING_CONFIG.MAX_USD_PER_MARKET
+                     )
+                else:
+                     strategy = StraddleArbStrategy(
+                        slug=slug,
+                        has_traded=has_traded,
+                        size_optimizer=size_optimizer,
+                        bankroll_usd=BANKROLL_USD
+                     )
 
                 # Setup log file with header if not exists
                 log_file = f"{LOG_FILE_PREFIX}_{slug}.csv"
@@ -417,8 +455,15 @@ def run():
                             "min_leg_price", "max_leg_price", "min_profit_per_share", "profit_both", "price_bounds_ok", "profit_ok", "skip_reason", "blocked_price_bounds", "blocked_low_profit",
                             "taker_path_attempted", "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                             "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
+                            "avg_cost_up", "avg_cost_down",
                             "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                            "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                            "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                            "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                            "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                            "entry_sum_target", "initial_edge_per_share",
+                            "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                            "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason",
+                            "ewma_sum_px", "ewma_samples", "last_completion_ts", "cooldown_remaining"
                         ])
                         writer.writeheader()
 
@@ -446,9 +491,26 @@ def run():
             up_bid, up_ask = pm_wrapper.get_orderbook(current_market["up_token_id"])
             down_bid, down_ask = pm_wrapper.get_orderbook(current_market["down_token_id"])
         except Exception as e:
-            print(f"[!] Orderbook error: {e}")
+            print(f"[XRP-BOT] [!] Orderbook error: {e}")
             time.sleep(1)
             continue
+            
+        if not DRY_RUN:
+            # [HYBRID-SYNC] Use API balance as a safety floor.
+            # Managed locally but synced after SYNC_GRACE_PERIOD
+            try:
+                now = time.time()
+                if (now - strategy.last_fill_ts) > strategy.SYNC_GRACE_PERIOD:
+                    up_bal = pm_wrapper.get_token_balance(current_market["up_token_id"])
+                    down_bal = pm_wrapper.get_token_balance(current_market["down_token_id"])
+                    if up_bal is not None and down_bal is not None:
+                        old_up, old_down = strategy.filled_up_shares, strategy.filled_down_shares
+                        strategy.sync_state(up_bal, down_bal)
+                        if abs(old_up - up_bal) > 0.01 or abs(old_down - down_bal) > 0.01:
+                            print(f"[XRP-BOT] [SYNC] Inventory updated: {old_up}/{old_down} -> {up_bal}/{down_bal}")
+            except Exception as e:
+                # Don't crash main loop on sync error
+                pass
 
         # Strategy tick
         enter_result = None
@@ -537,15 +599,32 @@ def run():
                         "skip_reason", "blocked_price_bounds", "blocked_low_profit", "taker_path_attempted",
                         "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                         "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
+                        "avg_cost_up", "avg_cost_down",
                         "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                        "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                        "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                        "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                        "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                        "entry_sum_target", "initial_edge_per_share",
+                        "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                        "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason"
                     ])
                     if not file_exists:
                         writer.writeheader()
                     writer.writerow(log_data)
                 last_csv_log_time = now
 
-            # Determine if we should use test sizing
+            elif enter_result["action"] == "IDLE":
+                reason = enter_result.get('reason', '')
+                sum_px = up_ask + down_ask
+                ewma = getattr(strategy, 'ewma_sum_px', 0.0) or 0.0
+                ewma_s = f"{ewma:.4f}" if ewma > 0 else "WARMUP"
+                
+                if "ORDER" not in reason: 
+                     max_sum = getattr(strategy, 'MAX_SUM_PRICE', 1.0)
+                     imbalance = strategy.filled_up_shares - strategy.filled_down_shares
+                     imb_s = f"{imbalance:+.1f}"
+                     inv_s = f"{strategy.filled_up_shares:.1f}/{strategy.filled_down_shares:.1f} (Imb: {imb_s})"
+                     print(f"[XRP-BOT] [STATUS] Spread: {sum_px:.4f} (Avg: {ewma_s}) | Inv: {inv_s} | Reason: {reason}")
         # USE_TEST_SIZING defined at top of loop
 
 
@@ -567,16 +646,16 @@ def run():
         if action_type == "TIMEOUT_CUT":
             # Transition to FLATTENING
             strategy.state = strategy.state.FLATTENING
-            print(f"[ETH-BOT] [UNWIND] Time Limit reached: {action_res.get('reason')}. Transitioning to FLATTENING.")
+            print(f"[XRP-BOT] [UNWIND] Time Limit reached: {action_res.get('reason')}. Transitioning to FLATTENING.")
             # Explicitly cancel open orders first
             if strategy.up_order_id and not strategy.up_filled:
                 pm_wrapper.cancel_order(strategy.up_order_id)
                 strategy.on_order_canceled(strategy.up_order_id)
-                print(f"[ETH-BOT] [UNWIND] Canceled UP order {strategy.up_order_id}")
+                print(f"[XRP-BOT] [UNWIND] Canceled UP order {strategy.up_order_id}")
             if strategy.down_order_id and not strategy.down_filled:
                 pm_wrapper.cancel_order(strategy.down_order_id)
                 strategy.on_order_canceled(strategy.down_order_id)
-                print(f"[ETH-BOT] [UNWIND] Canceled DOWN order {strategy.down_order_id}")
+                print(f"[XRP-BOT] [UNWIND] Canceled DOWN order {strategy.down_order_id}")
 
         elif action_type == "TAKER_COMPLETE":
              # Execute Taker Buy to complete the straddle
@@ -641,9 +720,10 @@ def run():
                     # If we use strict state machine, we should go to "UNWIND_PLACED" or check status.
                     # Simplified: Check status next loop or just wait a bit.
                     time.sleep(1.0) 
-                    is_filled, _, _ = pm_wrapper.check_order_status(unwind_order_id)
-                    if is_filled:
-                        print(f"[FLATTENING] Sell confirmed.")
+                    _is_filled, avg_px, _ = pm_wrapper.check_order_status(unwind_order_id)
+                    if _is_filled:
+                        print(f"[XRP-BOT] [FLATTENING] Sell confirmed at {avg_px:.4f}.")
+                        strategy._last_unwind_price = avg_px
                         if leg_to_sell == "UP": strategy.filled_up_shares -= qty_to_sell
                         else: strategy.filled_down_shares -= qty_to_sell
                         
@@ -673,12 +753,20 @@ def run():
             if status is True:
                 strategy.on_order_update(strategy.up_order_id, True, fill_price=px, filled_size=sz)
                 print(f"[FILL] UP order filled")
+            elif sz > 0:
+                # Capture partial fills
+                strategy.on_order_update(strategy.up_order_id, False, fill_price=px, filled_size=sz)
+                print(f"[PARTIAL] UP order fill: {sz} @ {px}")
 
         if strategy.down_order_id and not strategy.down_filled and not DRY_RUN:
             status, px, sz = pm_wrapper.check_order_status(strategy.down_order_id)
             if status is True:
                 strategy.on_order_update(strategy.down_order_id, True, fill_price=px, filled_size=sz)
                 print(f"[FILL] DOWN order filled")
+            elif sz > 0:
+                # Capture partial fills
+                strategy.on_order_update(strategy.down_order_id, False, fill_price=px, filled_size=sz)
+                print(f"[PARTIAL] DOWN order fill: {sz} @ {px}")
 
         # For dry run, simulate fills after some time
         if DRY_RUN and strategy.state.value == "ORDERS_OPEN":
@@ -690,11 +778,13 @@ def run():
                 strategy.on_order_update(strategy.down_order_id, True)
                 print(f"[FILL] (DRY) DOWN order filled")
 
-        # Check if strategy is DONE and ensure persistence
-        if strategy.state.value == "DONE" and not persisted_state.get(current_market["slug"]):
+        # Persistence Update (Periodic Save)
+        persisted_state[current_market["slug"]] = strategy.get_current_state()
+        save_state(persisted_state)
+
+        # Check if strategy is DONE
+        if strategy.state.value == "DONE" and not getattr(strategy, "has_printed_done", False):
              print(f"[DONE] Strategy execution completed for {current_market['slug']}")
-             persisted_state[current_market["slug"]] = True
-             save_state(persisted_state)
 
         # Log data
         # Append to CSV log (Decimated: Only if (!IDLE and !DONE) or >2s elapsed)
@@ -752,8 +842,15 @@ def run():
                     "skip_reason", "blocked_price_bounds", "blocked_low_profit", "taker_path_attempted",
                     "up_ask_at_send", "down_ask_at_send", "up_bid_at_send", "down_bid_at_send",
                     "filled_up_shares", "filled_down_shares", "target_size_shares", "size_locked_blocked", "overbuy_attempted",
+                    "avg_cost_up", "avg_cost_down",
                     "filled_first_price", "remaining_up", "remaining_down", "entry_id",
-                    "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts"
+                    "reprice_attempt_count", "reprice_reason", "time_in_one_leg_state", "last_reprice_ts",
+                    "inv_up", "inv_down", "total_inventory", "cap_remaining",
+                    "reconstruction_budget", "reconstruction_spent", "remaining_edge",
+                    "entry_sum_target", "initial_edge_per_share",
+                    "imbalance_shares", "avg_other_price", "px_missing_now", "overpay_per_share",
+                    "reconstruct_chunk_shares", "reconstruct_cost_est_usd", "reconstruct_overpay_limit", "reconstruct_block_reason",
+                    "ewma_sum_px", "ewma_samples", "last_completion_ts", "cooldown_remaining"
                 ])
                 if not file_exists:
                     writer.writeheader()
